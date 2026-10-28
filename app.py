@@ -268,6 +268,7 @@ with tab1:
         plan["soc_before"] = np.r_[soc_start, plan["soc"].values[:-1]]
         st.session_state["bid_plan"] = plan
         st.session_state["bid_reserve"] = reserve
+        st.session_state["tomorrow_price"] = pd.Series(exp_price.values, index=range(24))
 
         k1, k2, k3 = st.columns(3)
         k1.metric("배터리 없이 그대로 입찰", f"{psum['배터리 없이 예상 수입(원)'] / 10_000:,.1f}만 원")
@@ -489,9 +490,20 @@ with tab4:
 
     price_now = st.number_input(
         f"⚡ 지금({hour:02d}시) 실시간 가격 (원/kWh)", -100.0, 1000.0, float(day_prices[hour]), 1.0,
-        help="실제 실시간 가격을 알면 넣어 주세요. 비워 두면 가격표(하루전 가격) 값을 그대로 써요.",
+        help="기본값은 가격표(EPSIS 시간별 SMP, 전날 미리 정해진 하루전 기준 가격)의 이 시간 값이에요. "
+             "당일 실제 실시간 가격이 이와 다르면 새 값을 넣어 주세요. 판단이 실시간 가격 기준으로 바뀌어요.",
     )
-    future = day_prices[day_prices.index > hour]
+    st.caption(
+        "ℹ️ 위 가격은 **전날 미리 정해진 하루전 기준 가격**이에요. 당일 실시간 가격이 달라졌다면 "
+        "**새 가격을 직접 입력**해 주세요. (제주 실시간시장 가격은 15분마다 다시 정해져요.)"
+    )
+    TOMORROW_UNTIL = 9   # 내일 9시 전까지: 해가 뜨면 태양광으로 다시 채울 수 있어서 그 뒤는 안 봐도 됨
+    fut_today = day_prices[day_prices.index > hour]
+    future = pd.Series(fut_today.values, index=[f"오늘 {h:02d}시" for h in fut_today.index], dtype=float)
+    tp = st.session_state.get("tomorrow_price")
+    if tp is not None:
+        fut_tmr = tp[tp.index < TOMORROW_UNTIL]
+        future = pd.concat([future, pd.Series(fut_tmr.values, index=[f"내일 {h:02d}시" for h in fut_tmr.index])])
 
     # --- ② 이번 시간 상황 ---
     st.markdown("#### ② 이번 시간 상황")
@@ -528,11 +540,15 @@ with tab4:
     gap_txt = f"약속보다 **{abs(gap):,.0f} kWh 모자라요**" if gap < 0 else (
         f"약속보다 **{gap:,.0f} kWh 남아요**" if gap > 0 else "약속과 **딱 맞아요**")
     st.markdown(
-        f"{gap_txt} · 지금 가격 **{price_now:,.0f}원** · 오늘 남은 시간 최고가 **{info['future_best']:,.0f}원** · "
+        f"{gap_txt} · 지금 가격 **{price_now:,.0f}원** · 앞으로 최고가 **{info['future_best']:,.0f}원** · "
         f"배터리 1kWh 쓸 때 닳는 비용 **{info['c_deg']:,.1f}원**"
     )
     st.caption(
-        f"🔋 배터리에 남겨 둔 전기 1kWh의 가치 = 오늘 남은 최고가 {info['future_best']:,.0f}원 − 감가 {info['c_deg']:,.1f}원 "
+        (f"📈 앞으로 최고가 = **{future.idxmax()} {future.max():,.0f}원** "
+         f"(오늘 남은 시간{' + 내일 0~8시 예상 가격' if tp is not None else ''} 중 가장 비싼 시간). "
+         if len(future) else "📈 앞으로 비교할 시간이 없어요. ")
+        + ("" if tp is not None else "탭 1에서 내일 예측을 하면 내일 새벽·아침 예상 가격도 같이 비교해요. ")
+        + f"🔋 배터리에 남겨 둔 전기 1kWh의 가치 = 앞으로 최고가 {info['future_best']:,.0f}원 − 감가 {info['c_deg']:,.1f}원 "
         f"= **{info['hold_value']:,.1f}원**. 지금 쓰는 게 이보다 이득일 때만 꺼내요. "
         f"약속 안 한 추가 판매는 페널티 없는 범위({info['allowed']:,.0f} kWh) 안에서, 예비 충전량 {info['reserve']:.0%}를 남기고만 해요."
     )
