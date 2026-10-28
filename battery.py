@@ -334,6 +334,9 @@ def read_epsis_hourly(file):
     long["hour"] = long["h"].str.extract(r"(\d+)")[0].astype(int) - 1      # '1시' = 00~01시 구간
     long["price"] = pd.to_numeric(long["price"].astype(str).str.replace(",", ""), errors="coerce")
     long = long.rename(columns={dcol: "date"})[["date", "hour", "price"]]
+    # 아직 오지 않은 날(빈칸이거나 하루 종일 0)은 빼기
+    ok = long.groupby("date")["price"].transform(lambda x: x.notna().any() and (x.fillna(0) != 0).any())
+    long = long[ok]
     return long.sort_values(["date", "hour"]).reset_index(drop=True)
 
 
