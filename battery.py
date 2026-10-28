@@ -393,3 +393,41 @@ def expected_prices(prices_long: pd.DataFrame, days: int = 7) -> pd.Series:
     """최근 며칠의 시간대별 평균 가격 → '내일 예상 가격' (0~23시)"""
     recent = prices_long[prices_long["date"] >= prices_long["date"].max() - pd.Timedelta(days=days - 1)]
     return recent.groupby("hour")["price"].mean().reindex(range(24)).ffill().bfill()
+
+
+# ---------------------------------------------------------------------------
+# 유사일 기반 가격 예측: "내일과 날씨(햇빛 양)가 비슷했던 과거 날들"의 시간대별 가격 평균
+#   - 제주 한낮 가격은 맑아서 태양광이 넘치면 0원까지 떨어진다 → 단순 평균은 맑은 날·흐린 날을 섞어 버림
+#   - 햇빛 양의 지표 = 그날 태양광 이용률(발전량 ÷ 용량 ÷ 24)
+#       과거: 실측 이용률 (site_hourly_2025.csv)  /  내일: AI 예측 이용률
+#   - 같은 계절(±1개월)에서 이용률이 가장 비슷한 k일을 골라 평균
+#   - 과거 가격과 과거 발전량이 겹치는 날이 부족하면 최근 7일 평균으로 대체
+# ---------------------------------------------------------------------------
+def similar_day_prices(prices_long, daily_cf, target_cf, target_date, k=10, min_overlap=20):
+    mat = prices_long.pivot_table(index="date", columns="hour", values="price").reindex(columns=range(24))
+    mat = mat.dropna(thresh=20).ffill(axis=1).bfill(axis=1)
+    cf = daily_cf.copy()
+    cf.index = pd.to_datetime(cf.index)
+    common = mat.index.intersection(cf.index)
+    if len(common) < min_overlap:
+        return expected_prices(prices_long), dict(method="recent", n=0)
+
+    td = pd.Timestamp(target_date)
+    months = {((td.month - 1 + d) % 12) + 1 for d in (-1, 0, 1)}
+    pool = [d for d in common if d.month in months]
+    if len(pool) < k:
+        pool = list(common)
+    diff = (cf.loc[pool] - target_cf).abs().sort_values()
+    days = diff.index[:k]
+    est = mat.loc[days].mean()
+    return est, dict(method="similar", n=len(days), days=list(days),
+                     cf_mean=float(cf.loc[days].mean()), target_cf=float(target_cf))
+
+
+def daily_capacity_factor(hist: pd.DataFrame, sites) -> pd.Series:
+    """과거 실측 → 날짜별 이용률 (여러 지역이면 평균)"""
+    h = hist[hist["site"].isin(sites)].copy()
+    h["date"] = h["datetime"].dt.normalize()
+    d = h.groupby(["site", "date"]).agg(gen=("gen_kwh", "sum"), cap=("cap_kw", "first"))
+    d["cf"] = d["gen"] / (d["cap"] * 24)
+    return d.groupby("date")["cf"].mean()

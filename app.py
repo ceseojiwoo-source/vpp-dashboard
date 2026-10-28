@@ -1,3 +1,4 @@
+import altair as alt
 import folium
 import numpy as np
 import pandas as pd
@@ -32,6 +33,15 @@ ACTION_ICON = {"충전": "🔋⬆️", "방전": "🔋⬇️", "대기": "⏸️
 TOL_HELP = ("약속(급전지시)보다 이 범위를 넘게 더 보내면 임밸런스 페널티가 붙어요. "
             "전력시장운영규칙 [별표 33] 제주 시범사업 정산기준 3.가.(2)(라) 기준 8% (2025년, 2024년까지는 12%). "
             "시기에 따라, 또는 입찰제도가 육지로 확대되면서 기준이 달라질 수 있으니 최신 규칙에 맞게 설정하세요.")
+
+
+@st.cache_data
+def get_daily_cf(sites):
+    f = DATA_DIR / "site_hourly_2025.csv"
+    if not f.exists():
+        return None
+    hist = pd.read_csv(f, encoding="utf-8-sig", parse_dates=["datetime"])
+    return bt.daily_capacity_factor(hist, list(sites))
 
 
 @st.cache_data
@@ -166,9 +176,25 @@ with tab1:
             "AI가 예측한 발전량에 배터리 운전 계획을 얹어서, 시간별로 얼마나 팔겠다고 입찰할지 정해요. "
             "싼 시간에는 덜 팔고 배터리에 담았다가, 비싼 시간에 꺼내 파는 계획이에요. 배터리가 닳는 비용까지 빼고 계산해요."
         )
+        tomorrow_cf = float(res["pred_kwh"].sum() / (capacity * 24))
         if prices is not None and len(prices):
-            exp_price = bt.expected_prices(prices, days=7)
-            price_note = f"예상 가격 = 올린 가격 데이터의 최근 7일 시간대별 평균 ({prices['date'].max():%m/%d}까지)"
+            dcf = get_daily_cf(tuple(ref_sites))
+            if dcf is not None:
+                exp_price, pinfo = bt.similar_day_prices(prices, dcf, tomorrow_cf, day)
+            else:
+                exp_price, pinfo = bt.expected_prices(prices, days=7), dict(method="recent")
+            if pinfo["method"] == "similar":
+                price_note = (
+                    f"예상 가격 = **내일과 햇빛 양이 비슷했던 과거 {pinfo['n']}일**의 시간대별 평균 가격 "
+                    f"(내일 AI 예측 이용률 {pinfo['target_cf']:.1%} ↔ 고른 날들 실측 평균 {pinfo['cf_mean']:.1%}, 같은 계절 기준)"
+                )
+                with st.expander("가격 예측에 쓴 과거 날짜 보기"):
+                    st.write(", ".join(f"{d:%Y-%m-%d}" for d in pinfo["days"]))
+            else:
+                price_note = (
+                    f"예상 가격 = 올린 가격 데이터의 최근 7일 시간대별 평균 ({prices['date'].max():%m/%d}까지). "
+                    "⚠️ 날씨가 비슷한 날로 예측하려면 **2025년 시간별 SMP**(과거 발전 데이터와 같은 기간)를 올려 주세요."
+                )
         else:
             exp_price = pd.Series([100.0] * 24, index=range(24))
             price_note = "⚠️ 가격 데이터가 없어 모든 시간 100원으로 가정 → 시간대별 가격 차이가 없어서 배터리를 거의 안 써요"
@@ -199,11 +225,32 @@ with tab1:
         k3.metric("배터리 감가비용", f"{psum['배터리 감가비용(원)'] / 10_000:,.1f}만 원")
         st.caption(price_note)
 
-        view = pd.DataFrame({
-            "AI 예측 발전량": plan["gen_kwh"].values,
-            "추천 입찰량": plan["bid_kwh"].values,
-        }, index=[f"{h:02d}시" for h in range(24)])
-        st.line_chart(view, y_label="kWh")
+        # 막대 = AI 예측 발전량, 선 = 추천 입찰량 (둘이 같으면 선이 막대 꼭대기를 따라감)
+        hrs = [f"{h:02d}시" for h in range(24)]
+        cdf = pd.DataFrame({"시간": hrs, "AI 예측 발전량": plan["gen_kwh"].values,
+                            "추천 입찰량": plan["bid_kwh"].values,
+                            "배터리": plan["discharge_kwh"].values - plan["charge_kwh"].values})
+        bars = alt.Chart(cdf).mark_bar(color="#9cc3ea", opacity=0.8).encode(
+            x=alt.X("시간:N", sort=hrs, title=None), y=alt.Y("AI 예측 발전량:Q", title="kWh"),
+            tooltip=["시간", alt.Tooltip("AI 예측 발전량:Q", format=",.0f"), alt.Tooltip("추천 입찰량:Q", format=",.0f")])
+        line = alt.Chart(cdf).mark_line(color="#e8590c", strokeWidth=3, point=True).encode(
+            x=alt.X("시간:N", sort=hrs), y="추천 입찰량:Q")
+        st.altair_chart(bars + line, use_container_width=True)
+        st.caption("🟦 막대 = AI 예측 발전량 · 🟧 선 = 추천 입찰량. 선이 막대보다 낮은 시간엔 배터리에 담고, 높은 시간엔 꺼내 팔아요.")
+
+        moved = plan["charge_kwh"].sum() + plan["discharge_kwh"].sum()
+        if moved < 1:
+            gen_hours = plan["gen_kwh"] > 0
+            low = plan.loc[gen_hours, "price"].min() if gen_hours.any() else float("nan")
+            high = plan["price"].max()
+            c_deg = bt.base_degradation_cost(bcfg)
+            need = (low + c_deg * (1 + efficiency)) / efficiency if low == low else float("nan")
+            st.info(
+                f"이번 계획에선 **배터리를 쓰지 않는 게 이득**이라 추천 입찰량 = AI 예측 발전량이에요.\n\n"
+                f"발전하는 시간 중 가장 싼 가격 **{low:,.0f}원**에 담아서 가장 비싼 **{high:,.0f}원**에 팔아도, "
+                f"효율 손실({1 - efficiency:.0%})과 배터리 감가(1kWh당 {c_deg:,.1f}원)를 빼면 남는 게 없어요. "
+                f"비싼 시간 가격이 약 **{need:,.0f}원**은 넘어야 배터리를 써요."
+            )
 
         with st.expander("시간별 입찰표 보기 · 받기"):
             tbl = pd.DataFrame({
