@@ -208,3 +208,53 @@ def predict_location(model, meta, capacity_kw, forecast_df, lat, lon):
         preds.append(cf)
     cf = np.mean(preds, axis=0)
     return pd.DataFrame({"datetime": f["datetime"], "pred_kwh": cf * capacity_kw}), sites
+
+
+# ---------------------------------------------------------------------------
+# 8) 기상청 지상(종관, ASOS) 일자료: 과거 날짜별 '실제로 얼마나 맑았나'
+#    - 공공데이터포털 '기상청_지상(종관, ASOS) 일자료 조회서비스' 활용신청 필요 (키는 단기예보와 같은 키)
+#    - sumGsr = 하루 합계 일사량(MJ/m²), sumSsHr = 일조시간, avgTca = 평균 전운량(구름양, 0~10)
+#    - 전날(D-1)까지만 제공
+# ---------------------------------------------------------------------------
+ASOS_STATIONS = {
+    "제주": {184: "제주"},
+    "육지": {108: "서울", 133: "대전", 143: "대구", 156: "광주"},
+}
+
+
+def asos_daily(key, stn, start, end):
+    url = "http://apis.data.go.kr/1360000/AsosDalyInfoService/getWthrDataList"
+    rows, page = [], 1
+    while True:
+        params = {
+            "serviceKey": unquote(key.strip()), "pageNo": page, "numOfRows": 999, "dataType": "JSON",
+            "dataCd": "ASOS", "dateCd": "DAY", "startDt": start, "endDt": end, "stnIds": stn,
+        }
+        r = requests.get(url, params=params, timeout=30)
+        try:
+            body = r.json()
+        except ValueError:
+            raise RuntimeError("ASOS 응답을 읽지 못했어요. 'ASOS 일자료 조회서비스'를 활용신청했는지 확인하세요.\n" + r.text[:200])
+        header = body["response"]["header"]
+        if header.get("resultCode") != "00":
+            raise RuntimeError(f"ASOS 오류: {header.get('resultMsg')}")
+        b = body["response"]["body"]
+        items = b["items"]["item"]
+        rows += items if isinstance(items, list) else [items]
+        if page * 999 >= int(b.get("totalCount", 0)):
+            break
+        page += 1
+    t = pd.DataFrame(rows)
+    out = pd.DataFrame({"date": pd.to_datetime(t["tm"])})
+    for col, name in [("sumGsr", "gsr"), ("sumSsHr", "sunshine_hr"), ("avgTca", "cloud")]:
+        out[name] = pd.to_numeric(t.get(col), errors="coerce")
+    out["stn"] = stn
+    return out
+
+
+def asos_market(key, market, start="20230101"):
+    """시장(제주/육지) 대표 관측소들의 날짜별 일사량 평균"""
+    end = (datetime.now(KST) - timedelta(days=1)).strftime("%Y%m%d")
+    frames = [asos_daily(key, stn, start, end) for stn in ASOS_STATIONS[market]]
+    df = pd.concat(frames)
+    return df.groupby("date")[["gsr", "sunshine_hr", "cloud"]].mean()

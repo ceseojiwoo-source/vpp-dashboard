@@ -6,7 +6,7 @@ import streamlit as st
 from streamlit_folium import st_folium
 
 import battery as bt
-from predictor import DATA_DIR, is_jeju, latlon_to_grid, load_model, predict_location, tomorrow_forecast
+from predictor import DATA_DIR, asos_market, is_jeju, latlon_to_grid, load_model, predict_location, tomorrow_forecast
 
 st.set_page_config(page_title="Voltics | AI 전력 거래 엔진", page_icon="⚡", layout="wide")
 
@@ -39,6 +39,11 @@ ACTION_ICON = {"충전": "🔋⬆️", "방전": "🔋⬇️", "대기": "⏸️
 TOL_HELP = ("약속(급전지시)보다 이 범위를 넘게 더 보내면 임밸런스 페널티가 붙어요. "
             "전력시장운영규칙 [별표 33] 제주 시범사업 정산기준 3.가.(2)(라) 기준 8% (2025년, 2024년까지는 12%). "
             "시기에 따라, 또는 입찰제도가 육지로 확대되면서 기준이 달라질 수 있으니 최신 규칙에 맞게 설정하세요.")
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner="기상청 ASOS 과거 일사량을 받아오는 중...")
+def get_asos(key, market):
+    return asos_market(key, market)
 
 
 @st.cache_data
@@ -198,22 +203,41 @@ with tab1:
         tomorrow_cf = float(res["pred_kwh"].sum() / (capacity * 24))
         if prices is not None and len(prices):
             dcf = get_daily_cf(tuple(ref_sites))
-            if dcf is not None:
-                exp_price, pinfo = bt.similar_day_prices(prices, dcf, tomorrow_cf, day)
-            else:
-                exp_price, pinfo = bt.expected_prices(prices, days=7), dict(method="recent")
-            if pinfo["method"] == "similar":
+            pinfo = dict(method="recent")
+            # 1순위: ASOS 실측 일사량으로 2023~어제 전체에서 비슷한 날 찾기
+            asos_err = None
+            try:
+                sun = get_asos(key, market)
+                target_pct = bt.season_percentile(tomorrow_cf, dcf, day) if dcf is not None else 0.5
+                exp_price, pinfo = bt.similar_day_prices_asos(prices, sun["gsr"], target_pct, day)
+            except Exception as e:
+                asos_err = str(e)
+            # 2순위: 2025년 실측 발전량으로 비슷한 날 찾기 / 3순위: 최근 7일 평균
+            if pinfo["method"] != "asos":
+                if dcf is not None:
+                    exp_price, pinfo = bt.similar_day_prices(prices, dcf, tomorrow_cf, day)
+                else:
+                    exp_price, pinfo = bt.expected_prices(prices, days=7), dict(method="recent")
+
+            if pinfo["method"] == "asos":
                 price_note = (
-                    f"예상 가격 = **내일과 햇빛 양이 비슷했던 과거 {pinfo['n']}일**의 시간대별 평균 가격 "
+                    f"예상 가격 = **기상청 ASOS 실측 일사량** 기준으로 내일과 맑은 정도가 비슷했던 과거 {pinfo['n']}일의 가격 모양 "
+                    f"× 최근 28일 평균 가격 수준({pinfo['recent_level']:,.0f}원). "
+                    f"내일은 이 계절 기준 **맑은 정도 상위 {100 - pinfo['target_pct'] * 100:.0f}%** 예상이에요."
+                )
+            elif pinfo["method"] == "similar":
+                price_note = (
+                    f"예상 가격 = **내일과 햇빛 양이 비슷했던 2025년 {pinfo['n']}일**의 시간대별 평균 가격 "
                     f"(내일 AI 예측 이용률 {pinfo['target_cf']:.1%} ↔ 고른 날들 실측 평균 {pinfo['cf_mean']:.1%}, 같은 계절 기준)"
                 )
+            else:
+                price_note = f"예상 가격 = 최근 7일 시간대별 평균 ({prices['date'].max():%m/%d}까지)"
+            if asos_err:
+                price_note += (" · ℹ️ ASOS 일사량을 못 받아서 2025년 데이터로 대신 계산했어요. "
+                               "공공데이터포털에서 '기상청_지상(종관, ASOS) 일자료 조회서비스'를 활용신청해 주세요.")
+            if pinfo.get("days"):
                 with st.expander("가격 예측에 쓴 과거 날짜 보기"):
                     st.write(", ".join(f"{d:%Y-%m-%d}" for d in pinfo["days"]))
-            else:
-                price_note = (
-                    f"예상 가격 = 올린 가격 데이터의 최근 7일 시간대별 평균 ({prices['date'].max():%m/%d}까지). "
-                    "⚠️ 날씨가 비슷한 날로 예측하려면 **2025년 시간별 SMP**(과거 발전 데이터와 같은 기간)를 올려 주세요."
-                )
         else:
             exp_price = pd.Series([100.0] * 24, index=range(24))
             price_note = "⚠️ 가격 데이터가 없어 모든 시간 100원으로 가정 → 시간대별 가격 차이가 없어서 배터리를 거의 안 써요"

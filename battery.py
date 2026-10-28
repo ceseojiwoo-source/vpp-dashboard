@@ -434,3 +434,56 @@ def daily_capacity_factor(hist: pd.DataFrame, sites) -> pd.Series:
     d = h.groupby(["site", "date"]).agg(gen=("gen_kwh", "sum"), cap=("cap_kw", "first"))
     d["cf"] = d["gen"] / (d["cap"] * 24)
     return d.groupby("date")["cf"].mean()
+
+
+# ---------------------------------------------------------------------------
+# 유사일 가격 예측 (ASOS 버전): 2023~어제 전체에서 '내일과 맑은 정도가 비슷한 날'을 찾는다
+#   1) 내일이 '이 계절 기준으로 얼마나 맑은 날인지'를 백분위로 나타낸다
+#        (AI 예측 이용률이 같은 계절 과거 실측 이용률 중 몇 % 위치인지)
+#   2) 과거 날짜들도 ASOS 일사량으로 같은 계절 안에서의 백분위를 구한다
+#   3) 백분위가 가장 가까운 k일을 고른다 (같으면 최근 날짜 우선)
+#   4) '모양은 과거, 수준은 최근': 고른 날의 가격을 그 무렵 평균으로 나눠 모양만 가져오고,
+#      최근 28일 평균 가격을 곱한다 → 연료비 변화로 가격 수준이 달라져도 맞춰짐
+# ---------------------------------------------------------------------------
+def _doy_window(dates, target, window):
+    doy = pd.DatetimeIndex(dates).dayofyear.values
+    t = pd.Timestamp(target).dayofyear
+    diff = np.abs(doy - t)
+    return np.minimum(diff, 366 - diff) <= window
+
+
+def season_percentile(value, history: pd.Series, target_date, window=30):
+    h = history.dropna()
+    h = h[_doy_window(h.index, target_date, window)]
+    if len(h) == 0:
+        return 0.5
+    return float((h < value).mean() + 0.5 * (h == value).mean())
+
+
+def similar_day_prices_asos(prices_long, sun_daily: pd.Series, target_pct, target_date,
+                            k=10, window=30, recency_weight=0.03):
+    mat = prices_long.pivot_table(index="date", columns="hour", values="price").reindex(columns=range(24))
+    mat = mat.dropna(thresh=20).ffill(axis=1).bfill(axis=1)
+    sun = sun_daily.dropna()
+    sun.index = pd.to_datetime(sun.index)
+
+    # 그 날 무렵(앞뒤 14일) 평균 가격 → '모양' 계산용
+    daily_mean = mat.mean(axis=1)
+    level_around = daily_mean.rolling(29, center=True, min_periods=7).mean()
+
+    common = mat.index.intersection(sun.index)
+    pool = common[_doy_window(common, target_date, window)]
+    if len(pool) < k:
+        return None, dict(method="none")
+
+    # 각 날짜의 '같은 계절 안에서의 맑음 백분위'
+    pct = pd.Series({d: season_percentile(sun[d], sun, d, window) for d in pool})
+    years_ago = (pd.Timestamp(target_date) - pool.to_series()).dt.days / 365
+    score = (pct - target_pct).abs() + recency_weight * years_ago.values
+    days = score.sort_values().index[:k]
+
+    shape = mat.loc[days].div(level_around.loc[days].replace(0, np.nan), axis=0).mean()
+    recent_level = daily_mean[daily_mean.index > daily_mean.index.max() - pd.Timedelta(days=28)].mean()
+    est = (shape * recent_level).fillna(recent_level)
+    return est, dict(method="asos", n=len(days), days=list(days), target_pct=target_pct,
+                     pct_mean=float(pct.loc[days].mean()), recent_level=float(recent_level))
