@@ -6,7 +6,8 @@ import streamlit as st
 from streamlit_folium import st_folium
 
 import battery as bt
-from predictor import DATA_DIR, asos_market, is_jeju, latlon_to_grid, load_model, predict_location, tomorrow_forecast
+from predictor import (DATA_DIR, asos_market, is_jeju, latlon_to_grid, load_model, predict_location,
+                       reference_sites, tomorrow_forecast)
 
 st.set_page_config(page_title="Voltics | AI 전력 거래 엔진", page_icon="⚡", layout="wide")
 
@@ -44,6 +45,12 @@ TOL_HELP = ("약속(급전지시)보다 이 범위를 넘게 더 보내면 임�
 @st.cache_data(ttl=6 * 3600, show_spinner="기상청 ASOS 과거 일사량을 받아오는 중...")
 def get_asos(key, market):
     return asos_market(key, market)
+
+
+@st.cache_data
+def load_hist():
+    f = DATA_DIR / "site_hourly_2025.csv"
+    return pd.read_csv(f, encoding="utf-8-sig", parse_dates=["datetime"]) if f.exists() else None
 
 
 @st.cache_data
@@ -129,7 +136,8 @@ bcfg = bt.BatteryConfig(energy_kwh=energy, power_kw=power, soh=soh, efficiency=e
                         soc_min=soc_range[0] / 100, soc_max=soc_range[1] / 100)
 
 
-tab1, tab4, tab3, tab2 = st.tabs(["☀️ 내일 발전량 예측", "⚡ 실시간 운영 판단", "🔋 2025년 성과 검증", "📊 모델 성능"])
+tab1, tab4, tab5, tab3, tab2 = st.tabs(
+    ["☀️ 내일 발전량 예측", "⚡ 실시간 운영 판단", "⏪ 과거 날짜 재현", "🔋 2025년 성과 검증", "📊 모델 성능"])
 
 # ---------- 탭 1: 내일 예측 ----------
 with tab1:
@@ -538,3 +546,114 @@ with tab4:
         "제주 시범사업 규칙상 실시간시장 입찰은 1시간 단위이고 **거래시간 75분 전에 마감**돼요. "
         "그래서 실제 운영에서는 '75분 뒤 시간'의 배터리 계획을 미리 정해 변경입찰에 반영하는 식으로 써요."
     )
+
+
+# ---------- 탭 5: 과거 날짜 재현 ----------
+with tab5:
+    st.subheader("그날 Voltics를 썼다면?")
+    st.caption(
+        "2025년의 하루를 골라, **그 전날 알 수 있었던 정보만으로** Voltics가 입찰표를 짜고, "
+        "**실제 발전량과 실제 가격**으로 정산해 봐요. 배터리 없이 AI 예측대로 입찰했을 때와 비교해요."
+    )
+    hist_all = load_hist()
+    if hist_all is None or prices is None or not len(prices):
+        st.warning("재현하려면 과거 발전 데이터(site_hourly_2025.csv)와 사이드바의 가격 데이터가 필요해요.")
+    else:
+        rs = reference_sites(lat, lon, meta)
+        hh = hist_all[hist_all["site"].isin(rs)].copy()
+        hh["date"] = hh["datetime"].dt.normalize()
+        hh["hour"] = hh["datetime"].dt.hour
+        hh["cf_pred"] = hh["pred_kwh"] / hh["cap_kw"]
+        hh["cf_act"] = hh["gen_kwh"] / hh["cap_kw"]
+        hcf = hh.groupby(["date", "hour"])[["cf_pred", "cf_act"]].mean().reset_index()
+        pmat = prices.pivot_table(index="date", columns="hour", values="price").reindex(columns=range(24))
+        avail = sorted(set(hcf["date"]) & set(pmat.dropna(thresh=20).index))
+
+        # 시연 추천 날짜: 한낮 0원이 있었던 맑은 날 / AI가 크게 과대예측한 흐린 날
+        dsum = hcf.groupby("date")[["cf_pred", "cf_act"]].mean()
+        zero_days = [d for d in avail if (pmat.loc[d, 10:14] <= 0).any()]
+        sunny_zero = dsum.loc[zero_days].sort_values("cf_act", ascending=False).index[:3] if zero_days else []
+        over = (dsum.loc[avail, "cf_pred"] - dsum.loc[avail, "cf_act"]).sort_values(ascending=False).index[:2]
+        picks = {f"☀️ 맑고 한낮 0원인 날 ({d:%Y-%m-%d})": d for d in sunny_zero}
+        picks.update({f"🌧️ AI가 많게 예측한 흐린 날 ({d:%Y-%m-%d})": d for d in over})
+        picks["📅 직접 고르기"] = None
+
+        c1, c2 = st.columns([2, 1])
+        choice = c1.selectbox("날짜 고르기", list(picks), help=f"{market} 지역 기준으로 시연하기 좋은 날을 골라 뒀어요.")
+        if picks[choice] is None:
+            d_sel = c1.date_input("날짜", avail[len(avail) // 2].date(), min_value=avail[0].date(), max_value=avail[-1].date())
+            D = pd.Timestamp(d_sel)
+            if D not in avail:
+                st.error("그 날짜는 데이터가 없어요. 다른 날짜를 골라 주세요.")
+                st.stop()
+        else:
+            D = picks[choice]
+        reserve_r = c2.slider("예비 충전량 (%)", 0, 50, 10, 5, key="rp_res") / 100
+        tol_r = c2.slider("페널티 없는 초과 범위 (%)", 0.0, 20.0, 8.0, 0.5, key="rp_tol", help=TOL_HELP)
+
+        day_cf = hcf[hcf["date"] == D].set_index("hour").reindex(range(24)).fillna(0)
+        pred = day_cf["cf_pred"].values * capacity
+        actual = day_cf["cf_act"].values * capacity
+        act_price = pmat.loc[D].values
+
+        # 전날까지의 정보로 가격 예측 (그날 이후 데이터는 안 봄)
+        past_prices = prices[prices["date"] < D]
+        dcf_all = dsum["cf_act"]
+        dcf_past = dcf_all[dcf_all.index < D]
+        pred_cf_day = float(pred.sum() / (capacity * 24))
+        pinfo = dict(method="recent")
+        try:
+            sun = get_asos(key, market)["gsr"]
+            sun = sun[sun.index < D]
+            tp = bt.season_percentile(pred_cf_day, dcf_past, D)
+            exp_p, pinfo = bt.similar_day_prices_asos(past_prices, sun, tp, D)
+        except Exception:
+            pass
+        if pinfo["method"] != "asos":
+            exp_p, pinfo = bt.similar_day_prices(past_prices, dcf_past, pred_cf_day, D, min_overlap=10)
+        exp_p = exp_p.reindex(range(24)).ffill().bfill()
+
+        plan_r, _ = bt.plan_day(pred, exp_p.values, bcfg, capacity, 0.5, reserve_r)
+        mcfg = bt.MarketConfig(tolerance_pct=tol_r)
+        base_r = bt.settle_actual(pred, actual, np.zeros(24), np.zeros(24), act_price, capacity, bcfg, mcfg)
+        volt_r = bt.settle_actual(plan_r["bid_kwh"].values, actual, plan_r["charge_kwh"].values,
+                                  plan_r["discharge_kwh"].values, act_price, capacity, bcfg, mcfg)
+
+        st.markdown(f"#### {D:%Y-%m-%d} ({'월화수목금토일'[D.dayofweek]}) · {capacity:,.0f} kW · {market}")
+        m1, m2, m3 = st.columns(3)
+        m1.metric("배터리 없이 AI 예측대로", f"{base_r['net'] / 10_000:,.1f}만 원",
+                  help="실제 판매수입 − 페널티")
+        m2.metric("Voltics 입찰표대로", f"{volt_r['net'] / 10_000:,.1f}만 원",
+                  f"{(volt_r['net'] - base_r['net']) / 10_000:+,.2f}만 원", help="실제 판매수입 − 페널티 − 배터리 감가")
+        m3.metric("예측 정확도", f"발전 {abs(pred.sum() - actual.sum()) / max(actual.sum(), 1):.0%} 오차",
+                  f"가격 평균 {np.nanmean(np.abs(exp_p.values - act_price)):,.0f}원 오차", delta_color="off")
+
+        hrs = [f"{h:02d}시" for h in range(24)]
+        g1, g2 = st.columns(2)
+        with g1:
+            st.caption("발전량 (kWh): AI 예측 · 실제 · Voltics 입찰")
+            st.line_chart(pd.DataFrame({"AI 예측": pred, "실제 발전": actual,
+                                        "Voltics 입찰": plan_r["bid_kwh"].values}, index=hrs))
+        with g2:
+            st.caption("가격 (원/kWh): 전날 예측 · 실제")
+            st.line_chart(pd.DataFrame({"전날 예측 가격": exp_p.values, "실제 가격": act_price}, index=hrs))
+
+        moved = plan_r["charge_kwh"].sum() + plan_r["discharge_kwh"].sum()
+        if moved > 0:
+            ch_h = [h for h in range(24) if plan_r["charge_kwh"].iloc[h] > 1]
+            dis_h = [h for h in range(24) if plan_r["discharge_kwh"].iloc[h] > 1]
+            st.info(f"🔋 Voltics는 {', '.join(f'{h}시' for h in ch_h)}에 배터리를 채우고 "
+                    f"{', '.join(f'{h}시' for h in dis_h)}에 꺼내 파는 입찰표를 짰어요.")
+        else:
+            st.info("🔋 이날은 예상 가격 차이가 배터리 닳는 비용보다 작아서 배터리를 쓰지 않는 계획이었어요.")
+
+        with st.expander("정산 자세히 보기"):
+            st.dataframe(pd.DataFrame({
+                "배터리 없이": [base_r["revenue"], base_r["penalty"], 0, base_r["net"]],
+                "Voltics": [volt_r["revenue"], volt_r["penalty"], volt_r["degradation"], volt_r["net"]],
+            }, index=["판매수입(원)", "초과 페널티(원)", "배터리 감가(원)", "순수익(원)"]).style.format("{:,.0f}"),
+                use_container_width=True)
+            st.caption("정산 가정: 하루전·실시간 가격을 같은 시간별 SMP로 보고, 약속보다 허용범위를 넘게 더 보낸 양에만 페널티(별표 33 방식). "
+                       f"가격 예측 방식: {'ASOS 일사량 유사일' if pinfo['method'] == 'asos' else '2025년 발전량 유사일'}. "
+                       "AI 예측값은 팀원 모델 B의 2025년 시험 결과(그날 관측된 기온·습도·바람·비 입력)라서, "
+                       "실제 전날 예보로 예측했을 때보다 조금 더 정확하게 나올 수 있어요.")

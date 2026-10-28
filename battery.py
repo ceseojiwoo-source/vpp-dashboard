@@ -461,7 +461,7 @@ def season_percentile(value, history: pd.Series, target_date, window=30):
 
 
 def similar_day_prices_asos(prices_long, sun_daily: pd.Series, target_pct, target_date,
-                            k=10, window=30, recency_weight=0.03):
+                            k=10, window=30, recency_weight=0.15):
     mat = prices_long.pivot_table(index="date", columns="hour", values="price").reindex(columns=range(24))
     mat = mat.dropna(thresh=20).ffill(axis=1).bfill(axis=1)
     sun = sun_daily.dropna()
@@ -487,3 +487,31 @@ def similar_day_prices_asos(prices_long, sun_daily: pd.Series, target_pct, targe
     est = (shape * recent_level).fillna(recent_level)
     return est, dict(method="asos", n=len(days), days=list(days), target_pct=target_pct,
                      pct_mean=float(pct.loc[days].mean()), recent_level=float(recent_level))
+
+
+# ---------------------------------------------------------------------------
+# 과거 날짜 재현: "그날 Voltics를 썼다면?"
+#   - 전날 기준으로 알 수 있었던 정보만 사용 (그날 이후 데이터는 안 봄)
+#       AI 예측 발전량 = 그날의 모델 B 예측값, 예상 가격 = 그 전날까지의 데이터로 유사일 예측
+#   - 실제 결과 = 그날의 실제 발전량 + 실제 가격으로 정산
+#   - 비교: 배터리 없이 AI 예측대로 입찰 vs Voltics 입찰표(배터리 포함)
+# ---------------------------------------------------------------------------
+def settle_actual(bid, actual_gen, charge, discharge, price, cap_kw, b: BatteryConfig, m: MarketConfig):
+    """계획대로 배터리를 돌렸을 때 실제 정산.
+    충전은 그 시간 실제 발전량 안에서만 가능, 방전은 계획량만큼 (배터리에 들어 있다고 가정)."""
+    c = np.minimum(charge, actual_gen)
+    d = np.asarray(discharge, dtype=float)
+    delivered = actual_gen - c + d
+    revenue = delivered * price
+    penalty = penalty_over(delivered - bid, cap_kw, price, m)
+    deg = (c + d) * base_degradation_cost(b) if (c.sum() + d.sum()) > 0 else np.zeros_like(revenue)
+    return dict(delivered=delivered, revenue=float(revenue.sum()), penalty=float(penalty.sum()),
+                degradation=float(np.sum(deg)), net=float(revenue.sum() - penalty.sum() - np.sum(deg)))
+
+
+def penalty_over(diff_kwh, cap_kw, price, m: MarketConfig):
+    """별표33 방식: 약속보다 허용범위(용량 × tolerance%)를 넘게 '더' 보낸 양에만 페널티.
+    모자란 양은 페널티 없이 실시간 가격으로 정산(여기선 같은 가격으로 이미 반영)."""
+    allowed = cap_kw * m.tolerance_pct / 100
+    over = np.maximum(np.asarray(diff_kwh) - allowed, 0)
+    return over * np.maximum(price, 0) * m.penalty_ratio
