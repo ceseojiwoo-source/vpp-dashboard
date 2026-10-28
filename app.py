@@ -6,7 +6,7 @@ import streamlit as st
 from streamlit_folium import st_folium
 
 import battery as bt
-from predictor import DATA_DIR, latlon_to_grid, load_model, predict_location, tomorrow_forecast
+from predictor import DATA_DIR, is_jeju, latlon_to_grid, load_model, predict_location, tomorrow_forecast
 
 st.set_page_config(page_title="Voltics | AI 전력 거래 엔진", page_icon="⚡", layout="wide")
 
@@ -27,7 +27,13 @@ def get_metrics():
     return pd.read_csv(DATA_DIR / "metrics_by_site.csv", encoding="utf-8-sig")
 
 
-PRICE_FILE = DATA_DIR / "jeju_smp_hourly.csv"
+PRICE_FILES = {"제주": DATA_DIR / "jeju_smp_hourly.csv", "육지": DATA_DIR / "land_smp_hourly.csv"}
+MARKET_HELP = (
+    "전기 가격은 시장마다 달라요. 제주 발전소는 제주 가격, 육지 발전소는 육지 가격으로 팔아요. "
+    "지도에서 고른 위치에 맞는 가격을 자동으로 써요. "
+    "참고: 2026년 현재 재생에너지 입찰제도는 제주에서만 시범 시행 중이에요(전력시장운영규칙 별표 33). "
+    "육지 결과는 제도가 육지로 확대될 때를 대비한 시나리오로 봐 주세요."
+)
 EPSIS_URL = "https://epsis.kpx.or.kr/epsisnew/selectEkmaSmpShdChart.do?menuId=040202"
 ACTION_ICON = {"충전": "🔋⬆️", "방전": "🔋⬇️", "대기": "⏸️"}
 TOL_HELP = ("약속(급전지시)보다 이 범위를 넘게 더 보내면 임밸런스 페널티가 붙어요. "
@@ -92,19 +98,26 @@ with st.sidebar:
     soc_range = st.slider("사용할 충전량 범위 (%)", 0, 100, (10, 90), 5, key="soc" + key)
 
     st.divider()
-    st.header("전기 가격")
-    st.link_button("📈 전력거래소 시간별 SMP 바로가기", EPSIS_URL, use_container_width=True)
-    st.caption("구분(제주/육지)과 기간을 고르고 **조회 → CSV**로 받아서 아래에 올려 주세요. 최근 며칠치면 충분해요.")
-    up = st.file_uploader("EPSIS '시간별 SMP' CSV", type=["csv"])
-    prices = None
-    if up is not None:
-        prices = load_price_file(up.getvalue())
-    elif PRICE_FILE.exists():
-        prices = load_price_file(PRICE_FILE.read_bytes())
-    if prices is not None and len(prices):
-        st.caption(f"가격 데이터: {prices['date'].min():%Y-%m-%d} ~ {prices['date'].max():%Y-%m-%d}")
+    st.header("전기 가격", help=MARKET_HELP)
+    market = "제주" if is_jeju(lat, lon) else "육지"
+    if market == "제주":
+        st.success("📍 제주 발전소 → **제주 가격** 적용 · 입찰제도 시행 지역")
     else:
-        st.caption("⚠️ 가격 데이터가 없어서 모든 시간을 100원으로 가정해요.")
+        st.warning("📍 육지 발전소 → **육지 가격** 적용 · 입찰제도 **확대 대비 시나리오**", icon="🧭")
+    st.link_button("📈 전력거래소 시간별 SMP 바로가기", EPSIS_URL, use_container_width=True)
+    st.caption("구분(제주/육지)과 기간(**2023년 1월 ~ 오늘** 권장)을 고르고 **조회 → CSV**로 받아서 맞는 칸에 올려 주세요.")
+    all_prices = {}
+    for mk in ["제주", "육지"]:
+        up = st.file_uploader(f"{mk} 시간별 SMP CSV", type=["csv"], key=f"up_{mk}")
+        if up is not None:
+            all_prices[mk] = load_price_file(up.getvalue())
+        elif PRICE_FILES[mk].exists():
+            all_prices[mk] = load_price_file(PRICE_FILES[mk].read_bytes())
+    prices = all_prices.get(market)
+    for mk, pr in all_prices.items():
+        st.caption(f"{mk} 가격: {pr['date'].min():%Y-%m-%d} ~ {pr['date'].max():%Y-%m-%d}" + (" ← 사용 중" if mk == market else ""))
+    if prices is None or not len(prices):
+        st.caption(f"⚠️ {market} 가격 데이터가 없어서 모든 시간을 100원으로 가정해요.")
 
 bcfg = bt.BatteryConfig(energy_kwh=energy, power_kw=power, soh=soh, efficiency=efficiency,
                         capex_won_per_kwh=capex, cycle_life=cycle_life,
@@ -143,6 +156,12 @@ with tab1:
         peak = res.loc[res["pred_kwh"].idxmax()]
 
         st.subheader(f"{capacity:,.0f} kW 발전소 · {day} 예측")
+        if market == "육지":
+            st.info(
+                "🧭 **육지 확대 대비 시나리오**: 2026년 현재 재생에너지 입찰제도는 제주에서만 시범 시행 중이에요. "
+                "육지 발전소 결과는 제도가 육지로 확대될 때 Voltics가 어떻게 쓰일지 보여 주는 참고용이에요. "
+                "(육지는 2026년 3월부터 재생에너지 준중앙급전이 시작되는 등 제도 확대가 진행 중이에요.)"
+            )
         c1, c2, c3 = st.columns(3)
         c1.metric("하루 총 예상 발전량", f"{total:,.0f} kWh")
         c2.metric("가장 많이 나오는 시간", f"{peak['datetime'].hour}시 · {peak['pred_kwh']:,.0f} kWh")
@@ -413,7 +432,7 @@ with tab4:
 
     # --- ① 오늘 가격표: EPSIS 시간별 SMP(하루전 가격) + 지금 실시간 가격 ---
     st.markdown("#### ① 오늘 가격표")
-    st.caption("가격 데이터는 왼쪽 사이드바 '전기 가격'에서 올려요.")
+    st.caption(f"가격 데이터는 왼쪽 사이드바 '전기 가격'에서 올려요. 지금은 **{market} 가격**을 쓰고 있어요.")
 
     now_kst = pd.Timestamp.now(tz="Asia/Seoul")
     p1, p2 = st.columns(2)

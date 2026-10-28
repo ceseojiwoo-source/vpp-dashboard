@@ -181,9 +181,12 @@ def latlon_to_grid(lat, lon):
 #      (내륙 지역의 실제 위치가 확인되면 '가장 가까운 지역'으로 바꾸면 됨)
 #    태양 고도는 고른 위치의 위도로 정확히 계산한다.
 # ---------------------------------------------------------------------------
+def is_jeju(lat, lon):
+    return 33.0 <= lat <= 33.7 and 126.0 <= lon <= 127.0
+
+
 def reference_sites(lat, lon, meta):
-    jeju = 33.0 <= lat <= 33.7 and 126.0 <= lon <= 127.0
-    if jeju:
+    if is_jeju(lat, lon):
         return [s for s in meta["sites"] if s.startswith("제주")]
     return [s for s in meta["sites"] if not s.startswith("제주")]
 
