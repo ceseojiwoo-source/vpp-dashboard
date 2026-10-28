@@ -5,3 +5,5 @@ joblib
 requests
 scikit-learn
 xgboost
+folium
+streamlit-folium

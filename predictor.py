@@ -150,3 +150,58 @@ def sample_forecast():
         "wind": 2.0,
         "rain": 0.0,
     }), tmr
+
+
+# ---------------------------------------------------------------------------
+# 6) 위도·경도 → 기상청 격자(nx, ny) 변환 (기상청 공식 Lambert 투영식)
+#    기상청은 전국을 5km 네모칸으로 나누고 칸마다 번호(nx, ny)를 붙여 예보한다.
+# ---------------------------------------------------------------------------
+def latlon_to_grid(lat, lon):
+    import math
+    RE, GRID_KM, SLAT1, SLAT2, OLON, OLAT, XO, YO = 6371.00877, 5.0, 30.0, 60.0, 126.0, 38.0, 43, 136
+    D = math.pi / 180.0
+    re = RE / GRID_KM
+    slat1, slat2, olon, olat = SLAT1 * D, SLAT2 * D, OLON * D, OLAT * D
+    sn = math.log(math.cos(slat1) / math.cos(slat2)) / math.log(
+        math.tan(math.pi * 0.25 + slat2 * 0.5) / math.tan(math.pi * 0.25 + slat1 * 0.5))
+    sf = math.tan(math.pi * 0.25 + slat1 * 0.5) ** sn * math.cos(slat1) / sn
+    ro = re * sf / math.tan(math.pi * 0.25 + olat * 0.5) ** sn
+    ra = re * sf / math.tan(math.pi * 0.25 + lat * D * 0.5) ** sn
+    theta = lon * D - olon
+    theta = (theta + 2 * math.pi) if theta < -math.pi else (theta - 2 * math.pi) if theta > math.pi else theta
+    theta *= sn
+    return int(ra * math.sin(theta) + XO + 0.5), int(ro - ra * math.cos(theta) + YO + 0.5)
+
+
+# ---------------------------------------------------------------------------
+# 7) 아무 위치나 예측하기
+#    모델은 5개 학습 지역 중 하나를 골라야 한다(지역마다 발전소 특성이 조금씩 다름).
+#    - 제주도 안이면 제주#1
+#    - 육지면 육지 4곳(내륙#1~3, 한빛#1)으로 각각 예측해서 평균
+#      (내륙 지역의 실제 위치가 확인되면 '가장 가까운 지역'으로 바꾸면 됨)
+#    태양 고도는 고른 위치의 위도로 정확히 계산한다.
+# ---------------------------------------------------------------------------
+def reference_sites(lat, lon, meta):
+    jeju = 33.0 <= lat <= 33.7 and 126.0 <= lon <= 127.0
+    if jeju:
+        return [s for s in meta["sites"] if s.startswith("제주")]
+    return [s for s in meta["sites"] if not s.startswith("제주")]
+
+
+def predict_location(model, meta, capacity_kw, forecast_df, lat, lon):
+    sites = reference_sites(lat, lon, meta)
+    f = forecast_df.copy().reset_index(drop=True)
+    f["datetime"] = pd.to_datetime(f["datetime"])
+    tf = time_features(f["datetime"], np.full(len(f), lat))
+    preds = []
+    for site in sites:
+        X = pd.concat(
+            [tf, pd.DataFrame({f"site_{x}": int(x == site) for x in meta["sites"]}, index=f.index),
+             f[["temp", "rain", "wind", "hum"]]],
+            axis=1,
+        )[meta["features_B"]]
+        cf = np.clip(model.predict(X), 0, 1)
+        cf[X["sun_alt"].values == 0] = 0
+        preds.append(cf)
+    cf = np.mean(preds, axis=0)
+    return pd.DataFrame({"datetime": f["datetime"], "pred_kwh": cf * capacity_kw}), sites
