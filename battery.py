@@ -233,3 +233,105 @@ def shrink_test_predictions(src_csv, dst_csv):
     g[["cap_kw", "gen_kwh", "pred_kwh", "smp"]] = g[["cap_kw", "gen_kwh", "pred_kwh", "smp"]].round(2)
     g.to_csv(dst_csv, index=False, encoding="utf-8-sig")
     return g
+
+
+# ---------------------------------------------------------------------------
+# 실시간 운영 판단: "이 시간에 배터리를 충전할까, 방전할까, 가만히 둘까?"
+#   - 약속량(하루 전 낙찰량)과 예상 실제 발전량의 차이를 본다
+#   - 모자란 만큼은 실시간 가격으로 정산(=사 오는 셈), 남는 만큼은 실시간 가격으로 받는다
+#   - 배터리 전기는 '지금' 쓰는 것과 '오늘 남은 시간 중 가장 비쌀 때' 쓰는 것을 비교한다
+#   - 모든 선택지에서 배터리가 닳는 비용(감가)을 뺀다
+# ---------------------------------------------------------------------------
+def decide_hour(promised_kwh, expected_kwh, price_now, future_prices, cap_kw,
+                b: BatteryConfig, soc_now: float, m: MarketConfig):
+    E = usable_energy(b, cap_kw)
+    P = b.power_kw if b.power_kw is not None else E * b.c_rate
+    eta = np.sqrt(b.efficiency)
+    c_deg = base_degradation_cost(b)
+    allowed = cap_kw * m.tolerance_pct / 100
+    future_best = max(future_prices) if len(future_prices) else 0.0
+
+    dev = expected_kwh - promised_kwh                     # + 남음 / - 모자람
+    can_dis = max(min(P, (soc_now - b.soc_min) * E * eta), 0.0)   # 지금 꺼낼 수 있는 양(계통에 나가는 양)
+    can_ch = max(min(P, (b.soc_max - soc_now) * E / eta), 0.0)    # 지금 넣을 수 있는 양(발전소에서 빼는 양)
+
+    def settle(delivered):
+        """약속 대비 정산(이번 시간): 약속분 수익은 이미 확정이므로 '차이'에 대한 돈만 계산"""
+        d = delivered - promised_kwh
+        money = d * price_now                                   # 모자라면 -(사 오는 돈), 남으면 +(추가 판매)
+        over = max(d - allowed, 0.0)                            # 별표33: 약속보다 허용범위 넘게 더 보내면 페널티
+        return money - over * max(price_now, 0) * m.penalty_ratio
+
+    options = []
+
+    # ① 대기
+    options.append(dict(action="대기", kwh=0.0, now=settle(expected_kwh), later=0.0, deg=0.0,
+                        why="배터리를 쓰지 않고 차이는 실시간 가격으로 정산해요."))
+
+    # ② 방전: 배터리 전기를 지금 쓴다. 대신 오늘 남은 시간 중 가장 비쌀 때 쓸 기회를 잃는다
+    #    후보: 모자란 만큼만 메우기 / 허용범위까지 더 보내기
+    if can_dis > 0:
+        best_d = None
+        for x in sorted({min(can_dis, max(-dev, 0.0)), min(can_dis, max(-dev, 0.0) + allowed)}):
+            if x <= 0:
+                continue
+            o = dict(action="방전", kwh=x, now=settle(expected_kwh + x), later=-x * future_best, deg=-x * c_deg,
+                     why=f"지금 {price_now:,.0f}원일 때 쓰는 대신, 오늘 남은 시간 최고가 {future_best:,.0f}원에 쓸 기회를 포기해요.")
+            o["total"] = o["now"] + o["later"] + o["deg"]
+            if best_d is None or o["total"] > best_d["total"]:
+                best_d = o
+        if best_d:
+            options.append(best_d)
+
+    # ③ 충전: 발전한 전기 일부를 지금 팔지 않고 담아 뒀다가 비쌀 때 판다
+    #    후보: 약속보다 남는 만큼만 / 넣을 수 있는 만큼 최대
+    if can_ch > 0 and expected_kwh > 0:
+        best_c = None
+        for y in sorted({min(can_ch, max(dev, 0.0)), min(can_ch, expected_kwh)}):
+            if y <= 0:
+                continue
+            out = y * eta * eta                                  # 나중에 실제로 꺼낼 수 있는 양 (효율 손실)
+            o = dict(action="충전", kwh=y, now=settle(expected_kwh - y), later=out * future_best,
+                     deg=-(y + out) * c_deg,
+                     why=f"지금 {price_now:,.0f}원에 팔지 않고 담아 뒀다가 {future_best:,.0f}원일 때 팔아요 "
+                         f"(효율 손실 {1 - b.efficiency:.0%}).")
+            o["total"] = o["now"] + o["later"] + o["deg"]
+            if best_c is None or o["total"] > best_c["total"]:
+                best_c = o
+        if best_c:
+            options.append(best_c)
+
+    for o in options:
+        o["total"] = o["now"] + o["later"] + o["deg"]
+    table = pd.DataFrame(options)
+    best = table.loc[table["total"].idxmax()]
+    info = dict(dev=dev, c_deg=c_deg, future_best=future_best, allowed=allowed,
+                can_dis=can_dis, can_ch=can_ch)
+    return best, table, info
+
+
+# ---------------------------------------------------------------------------
+# EPSIS(전력통계정보시스템) '시간별 SMP' CSV 읽기 → 날짜별 24시간 가격표
+# ---------------------------------------------------------------------------
+def read_epsis_hourly(file):
+    import io
+    import re
+    raw = file.read() if hasattr(file, "read") else open(file, "rb").read()
+    for enc in ["cp949", "utf-8-sig", "utf-8", "euc-kr"]:
+        try:
+            t = pd.read_csv(io.BytesIO(raw), encoding=enc)
+            break
+        except Exception:
+            continue
+    t.columns = [str(c).strip() for c in t.columns]
+    hcols = [c for c in t.columns if re.fullmatch(r"0?([1-9]|1\d|2[0-4])\s*(시|h)?", c)]
+    dcol = t.columns[0]
+    t = t[[dcol] + hcols].copy()
+    t[dcol] = pd.to_datetime(t[dcol].astype(str).str.replace(r"[^0-9]", "", regex=True).str[:8],
+                             format="%Y%m%d", errors="coerce")
+    t = t.dropna(subset=[dcol])
+    long = t.melt(id_vars=dcol, var_name="h", value_name="price")
+    long["hour"] = long["h"].str.extract(r"(\d+)")[0].astype(int) - 1      # '1시' = 00~01시 구간
+    long["price"] = pd.to_numeric(long["price"].astype(str).str.replace(",", ""), errors="coerce")
+    long = long.rename(columns={dcol: "date"})[["date", "hour", "price"]]
+    return long.sort_values(["date", "hour"]).reset_index(drop=True)
