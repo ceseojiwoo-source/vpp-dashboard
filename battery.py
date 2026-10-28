@@ -1,0 +1,204 @@
+"""
+Voltics 배터리 엔진 — 배터리 수명 감가를 고려한 임밸런스(예측 오차) 보정 시뮬레이터
+
+아이디어 (쉽게):
+  - 하루 전에 '입찰량(=예측 × 보정계수)'을 낸다.
+  - 실제 발전량이 입찰량과 다르면 페널티를 낸다.
+  - 남으면 배터리에 충전, 모자라면 배터리에서 방전해서 오차를 메운다.
+  - 그런데 배터리는 쓸수록 닳는다(감가). 그래서
+        '아끼는 페널티' > '배터리가 닳는 비용'  일 때만 배터리를 쓴다.  ← 수명 감가 고려형
+
+세 가지 전략을 같은 데이터로 비교한다.
+  1) 배터리 없음
+  2) 단순 운전   : 오차가 나면 무조건 배터리 사용
+  3) 감가 고려   : 감가비용보다 이득일 때만 사용 + SOC(충전량)가 너무 높거나 낮은 구간은 피함
+
+※ 페널티 규칙은 경영 파트 정산식이 나오기 전까지 쓰는 '가정'이다. penalty_cost() 한 곳만 바꾸면 된다.
+"""
+from dataclasses import dataclass
+
+import numpy as np
+import pandas as pd
+
+
+# ---------------------------------------------------------------------------
+# 설정값 (화면에서 슬라이더로 바꿀 수 있음)
+# ---------------------------------------------------------------------------
+@dataclass
+class BatteryConfig:
+    hours: float = 1.0               # 배터리 크기 = 발전소 용량 × 몇 시간 분량 (1.0 → 1MW 발전소에 1MWh)
+    c_rate: float = 0.5              # 한 시간에 낼 수 있는 출력 = 배터리 용량 × c_rate
+    efficiency: float = 0.90         # 충전→방전 왕복 효율
+    soc_min: float = 0.10            # 최저 충전량 (물리적 한계)
+    soc_max: float = 0.90            # 최고 충전량 (물리적 한계)
+    soc_init: float = 0.50           # 시작 충전량
+    capex_won_per_kwh: float = 400_000   # 배터리 설치비 (원/kWh)
+    cycle_life: float = 6_000        # 수명 사이클 (80% DoD 기준, 이 사이클을 쓰면 용량이 80%로 떨어짐)
+    stress_low: float = 0.20         # 이 아래로 내려가면 열화가 빨라지는 구간
+    stress_high: float = 0.80        # 이 위로 올라가면 열화가 빨라지는 구간
+    stress_factor: float = 2.0       # 위 구간에서 감가비용 배수
+
+
+@dataclass
+class MarketConfig:
+    bid_factor: float = 1.0          # 입찰량 = 예측 × bid_factor  (모델이 흐린 날 과대예측 → 1보다 작게 하면 유리할 수 있음)
+    tolerance_pct: float = 8.0       # 설비용량 대비 이 % 이내 오차는 페널티 없음
+    penalty_ratio: float = 1.0       # 허용범위를 넘는 오차 1kWh당 페널티 = SMP × penalty_ratio
+
+
+# ---------------------------------------------------------------------------
+# 비용 계산식
+# ---------------------------------------------------------------------------
+def base_degradation_cost(b: BatteryConfig) -> float:
+    """배터리로 1kWh를 움직일 때(충전 또는 방전) 닳는 비용(원/kWh).
+    설치비 ÷ (평생 충방전 가능한 총량). 1사이클 = 충전 1번 + 방전 1번."""
+    dod = 0.8
+    return b.capex_won_per_kwh / (2 * b.cycle_life * dod)
+
+
+def stress_multiplier(soc: float, b: BatteryConfig) -> float:
+    """충전량이 너무 높거나 낮은 상태에서 쓰면 더 빨리 닳는다."""
+    return b.stress_factor if (soc < b.stress_low or soc > b.stress_high) else 1.0
+
+
+def penalty_cost(deviation_kwh, cap_kw, smp, m: MarketConfig):
+    """[가정] 허용범위(용량 × tolerance%)를 넘는 오차에 SMP × penalty_ratio 만큼 페널티.
+    경영 파트의 KPX 정산식이 나오면 이 함수만 바꾸면 된다."""
+    allowed = cap_kw * m.tolerance_pct / 100
+    excess = np.maximum(np.abs(deviation_kwh) - allowed, 0)
+    return excess * smp * m.penalty_ratio
+
+
+# ---------------------------------------------------------------------------
+# 시뮬레이션
+# ---------------------------------------------------------------------------
+STRATEGIES = {"none": "배터리 없음", "naive": "단순 운전", "aware": "감가 고려 (Voltics)"}
+
+
+def simulate(df: pd.DataFrame, b: BatteryConfig, m: MarketConfig, strategy: str) -> pd.DataFrame:
+    """df 컬럼: datetime, cap_kw, gen_kwh(실제), pred_kwh(예측), smp(원/kWh)
+    시간 순서대로 한 줄씩 배터리를 운전한다."""
+    df = df.sort_values("datetime").reset_index(drop=True)
+    cap = float(df["cap_kw"].iloc[0])
+    E = cap * b.hours                     # 배터리 용량 (kWh)
+    P = E * b.c_rate                      # 시간당 최대 충방전량 (kWh)
+    eta = np.sqrt(b.efficiency)           # 충전·방전 각각의 효율
+    c0 = base_degradation_cost(b)
+    allowed = cap * m.tolerance_pct / 100
+
+    bid = df["pred_kwh"].to_numpy() * m.bid_factor
+    act = df["gen_kwh"].to_numpy()
+    smp = df["smp"].to_numpy()
+    n = len(df)
+
+    soc = b.soc_init
+    out_soc, out_ch, out_dis, out_deg = np.zeros(n), np.zeros(n), np.zeros(n), np.zeros(n)
+    use_battery = strategy != "none" and E > 0
+
+    for t in range(n):
+        dev = act[t] - bid[t]                       # + 남음 / - 모자람
+        excess = abs(dev) - allowed                 # 페널티가 붙는 양
+        ch = dis = deg = 0.0
+
+        if use_battery and excess > 0:
+            avoided = smp[t] * m.penalty_ratio      # 1kWh 메울 때 아끼는 페널티
+            if dev > 0:                             # 남는다 → 충전
+                room = (b.soc_max - soc) * E / eta
+                amount = min(excess, P, max(room, 0))
+                if strategy == "aware":
+                    # 고스트레스 구간(너무 꽉 참)에 들어가지 않는 만큼만, 그리고 이득일 때만
+                    safe = max((b.stress_high - soc) * E / eta, 0)
+                    cost_safe = c0
+                    cost_stress = c0 * b.stress_factor
+                    amt_safe = min(amount, safe) if avoided > cost_safe else 0.0
+                    amt_stress = (amount - min(amount, safe)) if avoided > cost_stress else 0.0
+                    amount = amt_safe + amt_stress
+                    deg = amt_safe * cost_safe + amt_stress * cost_stress
+                else:
+                    deg = amount * c0 * stress_multiplier(soc, b)
+                ch = amount
+                soc += ch * eta / E
+            else:                                   # 모자란다 → 방전
+                avail = (soc - b.soc_min) * E * eta
+                amount = min(excess, P, max(avail, 0))
+                if strategy == "aware":
+                    safe = max((soc - b.stress_low) * E * eta, 0)
+                    cost_safe = c0
+                    cost_stress = c0 * b.stress_factor
+                    amt_safe = min(amount, safe) if avoided > cost_safe else 0.0
+                    amt_stress = (amount - min(amount, safe)) if avoided > cost_stress else 0.0
+                    amount = amt_safe + amt_stress
+                    deg = amt_safe * cost_safe + amt_stress * cost_stress
+                else:
+                    deg = amount * c0 * stress_multiplier(soc, b)
+                dis = amount
+                soc -= dis / eta / E
+
+        # 여유 충전: 페널티가 안 붙는 범위(허용오차) 안에서 발전량 일부를 미리 배터리에 채워 둔다.
+        #   단순 운전 → 최고 충전량까지 꽉 채움 / 감가 고려 → 열화가 적은 중간 구간(stress_high)까지만
+        if use_battery and act[t] > 0:
+            target = b.stress_high if strategy == "aware" else b.soc_max
+            margin = (act[t] - ch + dis - bid[t]) + allowed      # 이만큼까지는 덜 팔아도 페널티 없음
+            room = (target - soc) * E / eta
+            rec = max(min(P - ch - dis, room, margin, act[t] - ch), 0.0)
+            if strategy == "aware" and smp[t] * m.penalty_ratio <= c0:
+                rec = 0.0                                          # 나중에 아낄 페널티가 감가비용보다 작으면 안 채움
+            if rec > 0:
+                deg += rec * c0 * (1.0 if strategy == "aware" else stress_multiplier(soc, b))
+                ch += rec
+                soc += rec * eta / E
+
+        out_soc[t], out_ch[t], out_dis[t], out_deg[t] = soc, ch, dis, deg
+
+    delivered = act - out_ch + out_dis
+    remaining_dev = delivered - bid
+    res = df.copy()
+    res["bid_kwh"] = bid
+    res["charge_kwh"] = out_ch
+    res["discharge_kwh"] = out_dis
+    res["soc"] = out_soc
+    res["delivered_kwh"] = delivered
+    res["revenue"] = delivered * smp
+    res["penalty"] = penalty_cost(remaining_dev, cap, smp, m)
+    res["degradation"] = out_deg
+    res["net"] = res["revenue"] - res["penalty"] - res["degradation"]
+    return res
+
+
+def summarize(res: pd.DataFrame, b: BatteryConfig) -> dict:
+    cap = float(res["cap_kw"].iloc[0])
+    E = cap * b.hours
+    throughput = res["charge_kwh"].sum() + res["discharge_kwh"].sum()
+    cycles = throughput / (2 * E) if E > 0 else 0.0
+    # 수명 소모: cycle_life(80% DoD) 사이클을 다 쓰면 용량 100% → 80%
+    soh_drop = cycles / (b.cycle_life * 0.8) * 20 if E > 0 else 0.0
+    return {
+        "판매수익(원)": res["revenue"].sum(),
+        "페널티(원)": res["penalty"].sum(),
+        "배터리 감가비용(원)": res["degradation"].sum(),
+        "순수익(원)": res["net"].sum(),
+        "등가 사이클(회)": cycles,
+        "수명 소모(%p)": soh_drop,
+    }
+
+
+def compare(df: pd.DataFrame, b: BatteryConfig, m: MarketConfig):
+    """세 전략을 모두 돌려서 (요약표, 전략별 시간별 결과) 반환"""
+    runs = {k: simulate(df, b, m, k) for k in STRATEGIES}
+    table = pd.DataFrame({STRATEGIES[k]: summarize(r, b) for k, r in runs.items()}).T
+    return table, runs
+
+
+# ---------------------------------------------------------------------------
+# 노트북 결과(test_predictions.csv, 45만 줄) → 지역별 시간 합계(약 4만 줄)로 줄이기
+# ---------------------------------------------------------------------------
+def shrink_test_predictions(src_csv, dst_csv):
+    t = pd.read_csv(src_csv, encoding="utf-8-sig", parse_dates=["datetime"])
+    g = (
+        t.groupby(["site", "datetime"], as_index=False)
+        .agg(cap_kw=("cap_kw", "sum"), gen_kwh=("gen_kwh", "sum"),
+             pred_kwh=("pred_B_예보대응", "sum"), smp=("smp", "first"))
+    )
+    g["smp"] = g.groupby("site")["smp"].transform(lambda s: s.ffill().bfill())
+    g.round(2).to_csv(dst_csv, index=False, encoding="utf-8-sig")
+    return g
