@@ -243,17 +243,29 @@ def shrink_test_predictions(src_csv, dst_csv):
 #   - 모든 선택지에서 배터리가 닳는 비용(감가)을 뺀다
 # ---------------------------------------------------------------------------
 def decide_hour(promised_kwh, expected_kwh, price_now, future_prices, cap_kw,
-                b: BatteryConfig, soc_now: float, m: MarketConfig):
+                b: BatteryConfig, soc_now: float, m: MarketConfig, reserve: float = 0.0):
+    """이번 시간에 충전·방전·대기 중 무엇이 가장 이득인지.
+
+    배터리 속 전기 1kWh의 가치 = 나중에 꺼내 팔 때 받을 돈 − 그때 닳는 비용
+                               = max(오늘 남은 시간 최고가 − 감가, 0)
+      → 지금 방전하면 이 가치를 지금 써 버리는 것, 지금 충전하면 이 가치를 새로 만드는 것.
+    방전은 두 가지:
+      - 모자란 만큼 메우기: 최저 충전량까지 써도 됨
+      - 약속 안 한 추가 판매: 페널티 없는 범위(허용범위) 안에서만, 예비 충전량은 남겨 두고
+    """
     E = usable_energy(b, cap_kw)
     P = b.power_kw if b.power_kw is not None else E * b.c_rate
     eta = np.sqrt(b.efficiency)
     c_deg = base_degradation_cost(b)
     allowed = cap_kw * m.tolerance_pct / 100
     future_best = max(future_prices) if len(future_prices) else 0.0
+    hold_value = max(future_best - c_deg, 0.0)              # 배터리에 남겨 둔 전기 1kWh의 가치
 
     dev = expected_kwh - promised_kwh                     # + 남음 / - 모자람
-    can_dis = max(min(P, (soc_now - b.soc_min) * E * eta), 0.0)   # 지금 꺼낼 수 있는 양(계통에 나가는 양)
-    can_ch = max(min(P, (b.soc_max - soc_now) * E / eta), 0.0)    # 지금 넣을 수 있는 양(발전소에서 빼는 양)
+    shortfall = max(-dev, 0.0)
+    can_dis = max(min(P, (soc_now - b.soc_min) * E * eta), 0.0)              # 최저 충전량까지
+    can_dis_extra = max(min(P, (soc_now - b.soc_min - reserve) * E * eta), 0.0)  # 예비 충전량은 남기고
+    can_ch = max(min(P, (b.soc_max - soc_now) * E / eta), 0.0)
 
     def settle(delivered):
         """약속 대비 정산(이번 시간): 약속분 수익은 이미 확정이므로 '차이'에 대한 돈만 계산"""
@@ -262,51 +274,51 @@ def decide_hour(promised_kwh, expected_kwh, price_now, future_prices, cap_kw,
         over = max(d - allowed, 0.0)                            # 별표33: 약속보다 허용범위 넘게 더 보내면 페널티
         return money - over * max(price_now, 0) * m.penalty_ratio
 
-    options = []
+    options = [dict(action="대기", kwh=0.0, now=settle(expected_kwh), later=0.0, deg=0.0,
+                    why="배터리를 쓰지 않고 차이는 실시간 가격으로 정산해요.")]
 
-    # ① 대기
-    options.append(dict(action="대기", kwh=0.0, now=settle(expected_kwh), later=0.0, deg=0.0,
-                        why="배터리를 쓰지 않고 차이는 실시간 가격으로 정산해요."))
+    # 방전 후보: ① 모자란 만큼 메우기  ② 메우고 + 약속 안 한 추가 판매(허용범위 안, 예비 충전량 제외)
+    cover = min(can_dis, shortfall)
+    extra = max(min(allowed, can_dis_extra - cover, P - cover), 0.0)
+    best_d = None
+    for x, kind in [(cover, "메우기"), (cover + extra, "추가 판매")]:
+        if x <= 0:
+            continue
+        o = dict(action="방전", kwh=x, now=settle(expected_kwh + x), later=-x * hold_value, deg=-x * c_deg)
+        o["total"] = o["now"] + o["later"] + o["deg"]
+        sold = f"모자란 {min(x, shortfall):,.0f} kWh를 메우" if shortfall > 0 else ""
+        add = x - min(x, shortfall)
+        if add > 0:
+            sold += (" 고, " if sold else "") + f"약속 안 한 {add:,.0f} kWh를 더 팔아요(페널티 없는 범위 안, 예비 충전량은 남김)"
+        else:
+            sold += "요"
+        o["why"] = f"{sold}. 지금 {price_now:,.0f}원이 오늘 남은 최고가 {future_best:,.0f}원보다 낫다고 봐요."
+        if best_d is None or o["total"] > best_d["total"]:
+            best_d = o
+    if best_d:
+        options.append(best_d)
 
-    # ② 방전: 배터리 전기를 지금 쓴다. 대신 오늘 남은 시간 중 가장 비쌀 때 쓸 기회를 잃는다
-    #    후보: 모자란 만큼만 메우기 / 허용범위까지 더 보내기
-    if can_dis > 0:
-        best_d = None
-        for x in sorted({min(can_dis, max(-dev, 0.0)), min(can_dis, max(-dev, 0.0) + allowed)}):
-            if x <= 0:
-                continue
-            o = dict(action="방전", kwh=x, now=settle(expected_kwh + x), later=-x * future_best, deg=-x * c_deg,
-                     why=f"지금 {price_now:,.0f}원일 때 쓰는 대신, 오늘 남은 시간 최고가 {future_best:,.0f}원에 쓸 기회를 포기해요.")
-            o["total"] = o["now"] + o["later"] + o["deg"]
-            if best_d is None or o["total"] > best_d["total"]:
-                best_d = o
-        if best_d:
-            options.append(best_d)
-
-    # ③ 충전: 발전한 전기 일부를 지금 팔지 않고 담아 뒀다가 비쌀 때 판다
-    #    후보: 약속보다 남는 만큼만 / 넣을 수 있는 만큼 최대
+    # 충전 후보: 남는 만큼만 / 넣을 수 있는 만큼 최대
     if can_ch > 0 and expected_kwh > 0:
         best_c = None
         for y in sorted({min(can_ch, max(dev, 0.0)), min(can_ch, expected_kwh)}):
             if y <= 0:
                 continue
-            out = y * eta * eta                                  # 나중에 실제로 꺼낼 수 있는 양 (효율 손실)
-            o = dict(action="충전", kwh=y, now=settle(expected_kwh - y), later=out * future_best,
-                     deg=-(y + out) * c_deg,
+            out = y * eta * eta
+            o = dict(action="충전", kwh=y, now=settle(expected_kwh - y), later=out * hold_value, deg=-y * c_deg,
                      why=f"지금 {price_now:,.0f}원에 팔지 않고 담아 뒀다가 {future_best:,.0f}원일 때 팔아요 "
-                         f"(효율 손실 {1 - b.efficiency:.0%}).")
+                         f"(효율 손실 {1 - b.efficiency:.0%}, 넣을 때·뺄 때 모두 감가 반영).")
             o["total"] = o["now"] + o["later"] + o["deg"]
             if best_c is None or o["total"] > best_c["total"]:
                 best_c = o
         if best_c:
             options.append(best_c)
 
-    for o in options:
-        o["total"] = o["now"] + o["later"] + o["deg"]
     table = pd.DataFrame(options)
+    table["total"] = table["now"] + table["later"] + table["deg"]
     best = table.loc[table["total"].idxmax()]
-    info = dict(dev=dev, c_deg=c_deg, future_best=future_best, allowed=allowed,
-                can_dis=can_dis, can_ch=can_ch)
+    info = dict(dev=dev, c_deg=c_deg, future_best=future_best, hold_value=hold_value, allowed=allowed,
+                can_dis=can_dis, can_dis_extra=can_dis_extra, can_ch=can_ch, reserve=reserve)
     return best, table, info
 
 

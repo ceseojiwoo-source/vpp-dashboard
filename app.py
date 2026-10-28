@@ -267,6 +267,7 @@ with tab1:
         plan.index = range(24)
         plan["soc_before"] = np.r_[soc_start, plan["soc"].values[:-1]]
         st.session_state["bid_plan"] = plan
+        st.session_state["bid_reserve"] = reserve
 
         k1, k2, k3 = st.columns(3)
         k1.metric("배터리 없이 그대로 입찰", f"{psum['배터리 없이 예상 수입(원)'] / 10_000:,.1f}만 원")
@@ -509,10 +510,17 @@ with tab4:
     expected = s2.number_input("지금 예상되는 실제 발전량 (kWh)", 0.0, 1_000_000.0, d_exp, 10.0, key=f"exp_{hour}_{d_exp}",
                                help="AI 예측값이 기본값이에요. 현장 계측값이나 최신 예보로 다시 예측한 값을 넣으세요.")
     soc_now = s3.slider("지금 배터리 충전량 SOC (%)", 0, 100, d_soc, 1, key=f"soc_{hour}_{d_soc}") / 100
-    tol = st.slider("페널티 없는 초과 범위 (설비용량 대비 %)", 0.0, 20.0, 8.0, 0.5, help=TOL_HELP)
+    t1, t2 = st.columns(2)
+    tol = t1.slider("페널티 없는 초과 범위 (설비용량 대비 %)", 0.0, 20.0, 8.0, 0.5, help=TOL_HELP)
+    res_default = int(round(st.session_state.get("bid_reserve", 0.1) * 100))
+    reserve_now = t2.slider(
+        "예비 충전량 (%)", 0, 50, res_default, 5, key=f"rt_res_{res_default}",
+        help="약속하지 않은 전기를 배터리에서 꺼내 더 팔 때도 이만큼은 남겨 둬요(예측이 틀릴 때 메우는 비상용). "
+             "모자란 걸 메울 때는 이 예비분까지 써요. 기본값은 탭 1 입찰표의 예비 충전량이에요.",
+    ) / 100
 
     best, opts, info = bt.decide_hour(promised, expected, price_now, future.values, capacity,
-                                      bcfg, soc_now, bt.MarketConfig(tolerance_pct=tol))
+                                      bcfg, soc_now, bt.MarketConfig(tolerance_pct=tol), reserve_now)
 
     # --- ③ 추천 ---
     st.markdown("#### ③ 추천")
@@ -523,6 +531,11 @@ with tab4:
         f"{gap_txt} · 지금 가격 **{price_now:,.0f}원** · 오늘 남은 시간 최고가 **{info['future_best']:,.0f}원** · "
         f"배터리 1kWh 쓸 때 닳는 비용 **{info['c_deg']:,.1f}원**"
     )
+    st.caption(
+        f"🔋 배터리에 남겨 둔 전기 1kWh의 가치 = 오늘 남은 최고가 {info['future_best']:,.0f}원 − 감가 {info['c_deg']:,.1f}원 "
+        f"= **{info['hold_value']:,.1f}원**. 지금 쓰는 게 이보다 이득일 때만 꺼내요. "
+        f"약속 안 한 추가 판매는 페널티 없는 범위({info['allowed']:,.0f} kWh) 안에서, 예비 충전량 {info['reserve']:.0%}를 남기고만 해요."
+    )
     base = opts.loc[opts["action"] == "대기", "total"].iloc[0]
     msg = f"## {ACTION_ICON[best.action]} {best.action}" + (f" {best.kwh:,.0f} kWh" if best.kwh else "")
     st.success(msg + f"\n\n대기보다 **{best.total - base:,.0f}원** 이득 · {best.why}")
@@ -531,7 +544,7 @@ with tab4:
                    "배터리 전기는 더 비싼 시간에 쓰는 편이 이득이에요.")
 
     show = opts[["action", "kwh", "now", "later", "deg", "total"]].copy()
-    show.columns = ["선택지", "양(kWh)", "이번 시간 정산(원)", "나중 시간 가치(원)", "배터리 감가(원)", "합계(원)"]
+    show.columns = ["선택지", "양(kWh)", "이번 시간 정산(원)", "배터리 속 전기 가치 변화(원)", "지금 닳는 비용(원)", "합계(원)"]
     st.dataframe(show.style.format({c: "{:,.0f}" for c in show.columns[1:]}),
                  use_container_width=True, hide_index=True)
     st.caption("이번 시간 정산 = (실제로 보낸 양 − 약속량) × 지금 가격 − 초과 페널티. "
