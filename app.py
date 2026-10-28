@@ -262,6 +262,7 @@ with tab3:
 
 # ---------- 탭 4: 실시간 운영 판단 ----------
 PRICE_FILE = DATA_DIR / "jeju_smp_hourly.csv"
+EPSIS_URL = "https://epsis.kpx.or.kr/epsisnew/selectEkmaSmpShdChart.do?menuId=040202"
 ACTION_ICON = {"충전": "🔋⬆️", "방전": "🔋⬇️", "대기": "⏸️"}
 
 
@@ -280,6 +281,9 @@ with tab4:
 
     # --- ① 오늘 가격표: EPSIS 시간별 SMP(하루전 가격) + 지금 실시간 가격 ---
     st.markdown("#### ① 오늘 가격표")
+    l1, l2 = st.columns([1, 2])
+    l1.link_button("📈 전력거래소 시간별 SMP 바로가기", EPSIS_URL, use_container_width=True)
+    l2.caption("링크에서 구분(제주/육지)과 기간을 고르고 **조회 → CSV**로 받은 뒤, 아래에 올려 주세요.")
     up = st.file_uploader("전력거래소 EPSIS '시간별 SMP' CSV (제주 또는 육지)", type=["csv"],
                           help="epsis.kpx.or.kr → 전력거래 → 계통한계가격 → 시간별SMP → CSV. 안 올리면 저장된 파일을 써요.")
     prices = None
