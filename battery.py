@@ -335,3 +335,61 @@ def read_epsis_hourly(file):
     long["price"] = pd.to_numeric(long["price"].astype(str).str.replace(",", ""), errors="coerce")
     long = long.rename(columns={dcol: "date"})[["date", "hour", "price"]]
     return long.sort_values(["date", "hour"]).reset_index(drop=True)
+
+
+# ---------------------------------------------------------------------------
+# 내일 입찰 계획: AI 발전량 예측 + 예상 가격 + 배터리 → 시간별 추천 입찰량
+#   목표: (각 시간 입찰량 × 예상 가격)의 합 − 배터리 감가비용 을 최대로
+#   방법: 선형계획법(LP)으로 24시간 충전·방전량을 한꺼번에 정한다
+#   규칙: - 배터리는 내 발전소 전기로만 충전 (계통에서 사 와서 충전하지 않음)
+#         - 하루가 끝날 때 배터리 충전량은 시작보다 줄지 않게 (공짜로 빼먹지 않기)
+#         - 예비 충전량(reserve)은 계획에 쓰지 않고 남겨 둠 → 예측이 틀릴 때 당일 메우는 용도
+# ---------------------------------------------------------------------------
+def plan_day(gen_kwh, price, b: BatteryConfig, cap_kw, soc_start=0.5, reserve=0.0):
+    from scipy.optimize import linprog
+
+    g = np.asarray(gen_kwh, dtype=float)
+    p = np.asarray(price, dtype=float)
+    n = len(g)
+    E = usable_energy(b, cap_kw)
+    P = b.power_kw if b.power_kw is not None else E * b.c_rate
+    eta = np.sqrt(b.efficiency)
+    c_deg = base_degradation_cost(b)
+    lo = min(b.soc_min + reserve, b.soc_max)
+    hi = b.soc_max
+    soc0 = min(max(soc_start, lo), hi)
+
+    if E <= 0 or P <= 0:
+        c = d = np.zeros(n)
+    else:
+        # 변수: [c_0..c_{n-1}, d_0..d_{n-1}]  (c=충전량, d=방전량, kWh)
+        # 최대화: Σ p(-c + d) − c_deg Σ(c + d)   → linprog는 최소화라서 부호 반대로
+        cost = np.concatenate([p + c_deg, -p + c_deg])
+        # SOC_t = soc0 + (η Σ_{k≤t} c_k − Σ_{k≤t} d_k / η) / E  ∈ [lo, hi]
+        L = np.tril(np.ones((n, n)))
+        A_soc = np.hstack([L * eta, -L / eta]) / E
+        A_ub = np.vstack([A_soc, -A_soc, -A_soc[-1:]])
+        b_ub = np.concatenate([np.full(n, hi - soc0), np.full(n, soc0 - lo), [0.0]])   # 마지막 줄: 끝 SOC ≥ 시작
+        bounds = [(0, min(P, gi)) for gi in g] + [(0, P)] * n
+        r = linprog(cost, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method="highs")
+        x = r.x if r.success else np.zeros(2 * n)
+        c, d = x[:n], x[n:]
+        c[c < 1e-6] = 0
+        d[d < 1e-6] = 0
+
+    soc = soc0 + np.cumsum(c * eta - d / eta) / E if E > 0 else np.full(n, soc0)
+    bid = g - c + d
+    out = pd.DataFrame({"gen_kwh": g, "price": p, "charge_kwh": c, "discharge_kwh": d, "bid_kwh": bid, "soc": soc})
+    summary = {
+        "배터리 없이 예상 수입(원)": float((g * p).sum()),
+        "배터리 포함 예상 수입(원)": float((bid * p).sum()),
+        "배터리 감가비용(원)": float(((c + d) * c_deg).sum()),
+    }
+    summary["순이득(원)"] = summary["배터리 포함 예상 수입(원)"] - summary["배터리 감가비용(원)"] - summary["배터리 없이 예상 수입(원)"]
+    return out, summary
+
+
+def expected_prices(prices_long: pd.DataFrame, days: int = 7) -> pd.Series:
+    """최근 며칠의 시간대별 평균 가격 → '내일 예상 가격' (0~23시)"""
+    recent = prices_long[prices_long["date"] >= prices_long["date"].max() - pd.Timedelta(days=days - 1)]
+    return recent.groupby("hour")["price"].mean().reindex(range(24)).ffill().bfill()
