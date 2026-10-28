@@ -15,6 +15,8 @@ Voltics 배터리 엔진 — 배터리 수명 감가를 고려한 임밸런스(�
 
 ※ 페널티 규칙은 경영 파트 정산식이 나오기 전까지 쓰는 '가정'이다. penalty_cost() 한 곳만 바꾸면 된다.
 """
+from __future__ import annotations
+
 from dataclasses import dataclass
 
 import numpy as np
@@ -26,6 +28,9 @@ import pandas as pd
 # ---------------------------------------------------------------------------
 @dataclass
 class BatteryConfig:
+    energy_kwh: float | None = None  # 사업자가 입력한 배터리 정격 용량(kWh). None이면 hours로 계산
+    power_kw: float | None = None    # 사업자가 입력한 최대 충방전 출력(kW). None이면 c_rate로 계산
+    soh: float = 1.0                 # 현재 건강도(State of Health). 0.85면 정격의 85%만 쓸 수 있음
     hours: float = 1.0               # 배터리 크기 = 발전소 용량 × 몇 시간 분량 (1.0 → 1MW 발전소에 1MWh)
     c_rate: float = 0.5              # 한 시간에 낼 수 있는 출력 = 배터리 용량 × c_rate
     efficiency: float = 0.90         # 충전→방전 왕복 효율
@@ -80,8 +85,8 @@ def simulate(df: pd.DataFrame, b: BatteryConfig, m: MarketConfig, strategy: str)
     시간 순서대로 한 줄씩 배터리를 운전한다."""
     df = df.sort_values("datetime").reset_index(drop=True)
     cap = float(df["cap_kw"].iloc[0])
-    E = cap * b.hours                     # 배터리 용량 (kWh)
-    P = E * b.c_rate                      # 시간당 최대 충방전량 (kWh)
+    E = usable_energy(b, cap)             # 배터리 용량 (kWh)
+    P = b.power_kw if b.power_kw is not None else E * b.c_rate   # 시간당 최대 충방전량 (kWh)
     eta = np.sqrt(b.efficiency)           # 충전·방전 각각의 효율
     c0 = base_degradation_cost(b)
     allowed = cap * m.tolerance_pct / 100
@@ -165,9 +170,14 @@ def simulate(df: pd.DataFrame, b: BatteryConfig, m: MarketConfig, strategy: str)
     return res
 
 
+def usable_energy(b: BatteryConfig, cap_kw: float) -> float:
+    rated = b.energy_kwh if b.energy_kwh is not None else cap_kw * b.hours
+    return rated * b.soh
+
+
 def summarize(res: pd.DataFrame, b: BatteryConfig) -> dict:
     cap = float(res["cap_kw"].iloc[0])
-    E = cap * b.hours
+    E = usable_energy(b, cap)
     throughput = res["charge_kwh"].sum() + res["discharge_kwh"].sum()
     cycles = throughput / (2 * E) if E > 0 else 0.0
     # 수명 소모: cycle_life(80% DoD) 사이클을 다 쓰면 용량 100% → 80%
@@ -189,6 +199,26 @@ def compare(df: pd.DataFrame, b: BatteryConfig, m: MarketConfig):
     return table, runs
 
 
+def scale_to_plant(df: pd.DataFrame, my_cap_kw: float) -> pd.DataFrame:
+    """지역 데이터(수십 MW)를 사업자 발전소 용량에 맞게 비율로 줄이거나 늘린다.
+    같은 지역이면 날씨가 비슷하니 '용량 대비 발전 비율(이용률)'은 같다고 본다."""
+    k = my_cap_kw / float(df["cap_kw"].iloc[0])
+    out = df.copy()
+    out["cap_kw"] = my_cap_kw
+    out["gen_kwh"] *= k
+    out["pred_kwh"] *= k
+    return out
+
+
+# 배터리 예시값 (실제 제품 사양이 아니라 일반적인 범위를 담은 시작값 — 사업자가 자기 값으로 바꿔 쓴다)
+PRESETS = {
+    "직접 입력": None,
+    "LFP 표준형 (예시)":   dict(duration_h=2.0, efficiency=0.88, cycle_life=6000, capex=300_000, soh=1.00),
+    "NMC 고출력형 (예시)": dict(duration_h=1.0, efficiency=0.90, cycle_life=4000, capex=350_000, soh=1.00),
+    "사용 중 배터리 (예시)": dict(duration_h=2.0, efficiency=0.85, cycle_life=6000, capex=300_000, soh=0.85),
+}
+
+
 # ---------------------------------------------------------------------------
 # 노트북 결과(test_predictions.csv, 45만 줄) → 지역별 시간 합계(약 4만 줄)로 줄이기
 # ---------------------------------------------------------------------------
@@ -200,5 +230,6 @@ def shrink_test_predictions(src_csv, dst_csv):
              pred_kwh=("pred_B_예보대응", "sum"), smp=("smp", "first"))
     )
     g["smp"] = g.groupby("site")["smp"].transform(lambda s: s.ffill().bfill())
-    g.round(2).to_csv(dst_csv, index=False, encoding="utf-8-sig")
+    g[["cap_kw", "gen_kwh", "pred_kwh", "smp"]] = g[["cap_kw", "gen_kwh", "pred_kwh", "smp"]].round(2)
+    g.to_csv(dst_csv, index=False, encoding="utf-8-sig")
     return g

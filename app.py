@@ -150,42 +150,60 @@ with tab3:
     else:
         hist = get_history()
 
-        c1, c2 = st.columns(2)
-        with c1:
-            sim_site = st.selectbox("지역", sorted(hist["site"].unique()), key="sim_site")
-            h = hist[hist["site"] == sim_site]
-            dmin, dmax = h["datetime"].min().date(), h["datetime"].max().date()
-            period = st.date_input("기간", (dmin, dmax), min_value=dmin, max_value=dmax)
-        with c2:
-            bid_factor = st.slider(
-                "입찰 보정계수 (입찰량 = 예측 × 계수)", 0.6, 1.2, 1.0, 0.05,
-                help="AI 모델이 흐린 날 많게 예측하는 경향이 있어서, 1보다 조금 낮추면 페널티가 줄 수 있어요.",
-            )
-            hours = st.slider("배터리 크기 (발전소 용량 × 몇 시간)", 0.0, 4.0, 1.0, 0.25,
-                              help="1.0이면 1,000kW 발전소에 1,000kWh 배터리")
+        st.markdown("#### ① 내 발전소")
+        c1, c2, c3 = st.columns(3)
+        sim_site = c1.selectbox("가장 가까운 지역 (날씨 패턴)", sorted(hist["site"].unique()), key="sim_site")
+        my_cap = c2.number_input("내 발전소 설비용량 (kW)", 10.0, 100_000.0, 3_000.0, 100.0,
+                                 help="같은 지역 실측 데이터를 내 용량에 맞게 비율로 환산해서 계산해요.")
+        h = hist[hist["site"] == sim_site]
+        dmin, dmax = h["datetime"].min().date(), h["datetime"].max().date()
+        period = c3.date_input("검증 기간", (dmin, dmax), min_value=dmin, max_value=dmax)
 
-        with st.expander("⚙️ 배터리·정산 가정 바꾸기 (경영 파트 정산식이 나오면 여기 값을 맞추세요)"):
-            e1, e2, e3 = st.columns(3)
-            capex = e1.number_input("배터리 설치비 (원/kWh)", 50_000, 2_000_000, 400_000, 50_000)
-            cycle_life = e2.number_input("수명 사이클 (회)", 1_000, 20_000, 6_000, 500)
-            efficiency = e3.slider("왕복 효율", 0.70, 0.98, 0.90, 0.01)
-            e4, e5, e6 = st.columns(3)
-            tolerance = e4.slider("페널티 없는 오차 범위 (설비용량 대비 %)", 0.0, 20.0, 8.0, 0.5)
-            penalty_ratio = e5.slider("페널티 단가 (SMP의 몇 배)", 0.0, 3.0, 1.0, 0.1)
-            stress = e6.slider("고·저 충전 구간 열화 배수", 1.0, 4.0, 2.0, 0.5,
-                               help="충전량 80% 이상·20% 이하에서 쓰면 이만큼 더 빨리 닳는다고 가정")
-            st.caption(
-                f"→ 배터리로 1kWh를 움직일 때 닳는 비용 ≈ **{capex / (2 * cycle_life * 0.8):,.1f}원**. "
-                "이 값보다 아끼는 페널티가 클 때만 Voltics가 배터리를 씁니다."
+        st.markdown("#### ② 내 배터리")
+        preset_name = st.radio("배터리 유형", list(bt.PRESETS), horizontal=True,
+                               help="예시값은 일반적인 범위의 시작값이에요. 보유한 배터리의 사양서 값으로 바꿔 넣으세요.")
+        ps = bt.PRESETS[preset_name] or dict(duration_h=1.0, efficiency=0.90, cycle_life=6000, capex=300_000, soh=1.0)
+        key = f"_{preset_name}"   # 유형을 바꾸면 입력칸 기본값도 바뀌도록
+        b1, b2, b3, b4 = st.columns(4)
+        energy = b1.number_input("배터리 용량 (kWh)", 0.0, 400_000.0, float(round(my_cap * ps["duration_h"])), 100.0,
+                                 key="e" + key)
+        power = b2.number_input("최대 충·방전 출력 (kW)", 0.0, 200_000.0,
+                                float(round(energy / ps["duration_h"])) if energy else 0.0, 100.0, key="p" + key)
+        efficiency = b3.slider("왕복 효율", 0.70, 0.98, ps["efficiency"], 0.01, key="ef" + key)
+        soh = b4.slider("현재 건강도 SOH (%)", 50, 100, int(ps["soh"] * 100), 1, key="soh" + key,
+                        help="새 배터리는 100%. 오래 써서 용량이 줄었으면 낮춰 주세요.") / 100
+        b5, b6, b7 = st.columns(3)
+        capex = b5.number_input("배터리 구입·설치비 (원/kWh)", 50_000, 2_000_000, ps["capex"], 10_000, key="c" + key)
+        cycle_life = b6.number_input("수명 사이클 (회, 80% DoD 기준)", 500, 20_000, ps["cycle_life"], 500, key="cl" + key)
+        soc_range = b7.slider("사용할 충전량 범위 (%)", 0, 100, (10, 90), 5, key="soc" + key)
+
+        with st.expander("⚙️ 입찰·정산 가정 (경영 파트 정산식이 나오면 여기 값을 맞추세요)"):
+            e1, e2, e3, e4 = st.columns(4)
+            bid_factor = e1.slider(
+                "입찰 보정계수", 0.6, 1.2, 1.0, 0.05,
+                help="입찰량 = 예측 × 계수. 2025년 데이터에서는 1.0(예측 그대로)이 가장 유리했어요.",
             )
+            tolerance = e2.slider("페널티 없는 오차 범위 (설비용량 대비 %)", 0.0, 20.0, 8.0, 0.5)
+            penalty_ratio = e3.slider("페널티 단가 (SMP의 몇 배)", 0.0, 3.0, 1.0, 0.1)
+            stress = e4.slider("고·저 충전 구간 열화 배수", 1.0, 4.0, 2.0, 0.5,
+                               help="충전량 80% 이상·20% 이하에서 쓰면 이만큼 더 빨리 닳는다고 가정")
+
+        st.caption(
+            f"→ 이 배터리로 1kWh를 움직일 때 닳는 비용 ≈ **{capex / (2 * cycle_life * 0.8):,.1f}원**. "
+            f"실제로 쓸 수 있는 용량 = {energy:,.0f} × SOH {soh:.0%} = **{energy * soh:,.0f} kWh**. "
+            "아끼는 페널티가 닳는 비용보다 클 때만 Voltics가 배터리를 씁니다."
+        )
 
         if isinstance(period, tuple) and len(period) == 2:
             start, end = pd.Timestamp(period[0]), pd.Timestamp(period[1]) + pd.Timedelta(days=1)
-            df = h[(h["datetime"] >= start) & (h["datetime"] < end)][
-                ["datetime", "cap_kw", "gen_kwh", "pred_kwh", "smp"]
-            ]
-            b_kwargs = dict(hours=hours, capex_won_per_kwh=capex, cycle_life=cycle_life,
-                            efficiency=efficiency, stress_factor=stress)
+            df = bt.scale_to_plant(
+                h[(h["datetime"] >= start) & (h["datetime"] < end)][["datetime", "cap_kw", "gen_kwh", "pred_kwh", "smp"]],
+                my_cap,
+            )
+            b_kwargs = dict(energy_kwh=energy, power_kw=power, soh=soh, capex_won_per_kwh=capex,
+                            cycle_life=cycle_life, efficiency=efficiency, stress_factor=stress,
+                            soc_min=soc_range[0] / 100, soc_max=soc_range[1] / 100,
+                            soc_init=(soc_range[0] + soc_range[1]) / 200)
             m_kwargs = dict(bid_factor=bid_factor, tolerance_pct=tolerance, penalty_ratio=penalty_ratio)
             table, runs = run_sim(df, b_kwargs, m_kwargs)
 
@@ -193,8 +211,9 @@ with tab3:
             naive = table.loc[bt.STRATEGIES["naive"], "순수익(원)"]
             aware = table.loc[bt.STRATEGIES["aware"], "순수익(원)"]
 
-            st.markdown(f"**{sim_site}** · 설비 {df['cap_kw'].iloc[0]:,.0f} kW · "
-                        f"배터리 {df['cap_kw'].iloc[0] * hours:,.0f} kWh · {period[0]} ~ {period[1]}")
+            st.markdown("#### ③ 결과")
+            st.markdown(f"**내 발전소 {my_cap:,.0f} kW ({sim_site} 날씨)** · 배터리 {energy:,.0f} kWh / {power:,.0f} kW "
+                        f"· SOH {soh:.0%} · {period[0]} ~ {period[1]}")
             k1, k2, k3 = st.columns(3)
             k1.metric("배터리 없음 순수익", won(base))
             k2.metric("단순 운전 순수익", won(naive), f"{won(naive - base)} vs 배터리 없음")
