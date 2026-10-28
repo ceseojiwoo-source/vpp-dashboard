@@ -317,9 +317,9 @@ with tab4:
     # --- ② 이번 시간 상황 ---
     st.markdown("#### ② 이번 시간 상황")
     s1, s2, s3 = st.columns(3)
-    promised = s1.number_input("하루 전 약속한 양 (kWh)", 0.0, 1_000_000.0, round(capacity * 0.6), 10.0,
+    promised = s1.number_input("하루 전 약속한 양 (kWh)", 0.0, 1_000_000.0, float(round(capacity * 0.6)), 10.0,
                                help="이 시간에 팔겠다고 낙찰받은 양")
-    expected = s2.number_input("지금 예상되는 실제 발전량 (kWh)", 0.0, 1_000_000.0, round(capacity * 0.45), 10.0,
+    expected = s2.number_input("지금 예상되는 실제 발전량 (kWh)", 0.0, 1_000_000.0, float(round(capacity * 0.45)), 10.0,
                                help="현장 계측값이나 초단기예보로 다시 예측한 값")
     soc_now = s3.slider("지금 배터리 충전량 SOC (%)", 0, 100, 50, 1) / 100
     tol = st.slider("페널티 없는 초과 범위 (설비용량 대비 %)", 0.0, 20.0, 8.0, 0.5,
