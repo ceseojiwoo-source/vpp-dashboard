@@ -1,19 +1,16 @@
 """
-Voltics 배터리 엔진 — 배터리 수명 감가를 고려한 임밸런스(예측 오차) 보정 시뮬레이터
+Voltics 배터리 엔진 — 배터리 수명 감가를 고려한 입찰·운영 계산
 
-아이디어 (쉽게):
-  - 하루 전에 '입찰량(=예측 × 보정계수)'을 낸다.
-  - 실제 발전량이 입찰량과 다르면 페널티를 낸다.
-  - 남으면 배터리에 충전, 모자라면 배터리에서 방전해서 오차를 메운다.
-  - 그런데 배터리는 쓸수록 닳는다(감가). 그래서
-        '아끼는 페널티' > '배터리가 닳는 비용'  일 때만 배터리를 쓴다.  ← 수명 감가 고려형
+구성
+  1) 배터리 감가 모델 (비선형): 기준 감가 × SoC 구간 계수 × C-rate 계수 × 방전깊이(DoD) 계수
+     - 배터리 종류(LFP/NMC)마다 계수가 다름 (CHEMISTRY)
+     - SoC 하드 리밋 5~95%: 사용자가 어떻게 설정해도 이 밖으로는 운전하지 않음
+  2) 시장 규칙 (MARKET_RULES): 제주 시범사업(별표 33) / 육지 확대 시나리오 — 규칙만 바꿔 끼우면 됨
+  3) 내일 입찰: bid_curve (가격-수량 3구간), plan_day (수량 계획, 비교용)
+  4) 당일 판단: decide_hour (충전·방전·대기)
+  5) 정산·검증: settle_actual, settle_curve, backtest_year
 
-세 가지 전략을 같은 데이터로 비교한다.
-  1) 배터리 없음
-  2) 단순 운전   : 오차가 나면 무조건 배터리 사용
-  3) 감가 고려   : 감가비용보다 이득일 때만 사용 + SOC(충전량)가 너무 높거나 낮은 구간은 피함
-
-※ 페널티 규칙은 경영 파트 정산식이 나오기 전까지 쓰는 '가정'이다. penalty_cost() 한 곳만 바꾸면 된다.
+※ 감가 계수는 일반적인 경향을 반영한 가정값이에요. 실제 서비스에서는 제조사 수명 데이터로 맞춥니다.
 """
 from __future__ import annotations
 
@@ -41,7 +38,28 @@ class BatteryConfig:
     cycle_life: float = 6_000        # 수명 사이클 (80% DoD 기준, 이 사이클을 쓰면 용량이 80%로 떨어짐)
     stress_low: float = 0.20         # 이 아래로 내려가면 열화가 빨라지는 구간
     stress_high: float = 0.80        # 이 위로 올라가면 열화가 빨라지는 구간
-    stress_factor: float = 2.0       # 위 구간에서 감가비용 배수
+    stress_factor: float = 2.0       # (옛 시뮬레이터용) 위 구간에서 감가비용 배수
+    # --- 비선형 감가 곡선 (배터리 종류별 기본값은 CHEMISTRY) ---
+    chem: str = "LFP"
+    soc_lo_alpha: float = 1.0        # SoC 20% 아래로 내려갈수록 감가 증가, 0%에서 (1+이 값)배
+    soc_hi_alpha: float = 0.5        # SoC 80% 위로 올라갈수록 감가 증가, 100%에서 (1+이 값)배
+    dod_k: float = 1.1               # 수명 ∝ DoD^(-k). k>1이면 깊게 쓸수록 kWh당 감가가 커짐
+    crate_beta: float = 0.3          # C-rate가 0.5C를 넘을 때 1C당 추가 배수
+
+    def __post_init__(self):
+        # SoC 하드 리밋: 어떤 입력이 와도 5~95% 밖으로는 운전하지 않음 (과충전·완전방전 방지)
+        self.soc_min = float(min(max(self.soc_min, HARD_SOC_MIN), HARD_SOC_MAX - 0.05))
+        self.soc_max = float(max(min(self.soc_max, HARD_SOC_MAX), self.soc_min + 0.05))
+
+
+HARD_SOC_MIN, HARD_SOC_MAX = 0.05, 0.95
+
+# 배터리 종류별 감가 곡선 기본값 (일반적 경향 기반 가정값 — 제조사 데이터로 교체 가능)
+#   LFP: 깊은 방전·고충전에 비교적 강함 / NMC: 고충전(80%↑)과 빠른 충방전에 더 민감
+CHEMISTRY = {
+    "LFP": dict(soc_lo_alpha=1.0, soc_hi_alpha=0.5, dod_k=1.1, crate_beta=0.3),
+    "NMC": dict(soc_lo_alpha=1.0, soc_hi_alpha=1.5, dod_k=1.5, crate_beta=0.6),
+}
 
 
 @dataclass
@@ -49,6 +67,34 @@ class MarketConfig:
     bid_factor: float = 1.0          # 입찰량 = 예측 × bid_factor  (모델이 흐린 날 과대예측 → 1보다 작게 하면 유리할 수 있음)
     tolerance_pct: float = 8.0       # 설비용량 대비 이 % 이내 오차는 페널티 없음
     penalty_ratio: float = 1.0       # 허용범위를 넘는 오차 1kWh당 페널티 = SMP × penalty_ratio
+    min_output_ratio: float = 0.10   # 별표33: 발전량이 설비용량의 이 비율 미만인 시간은 페널티 면제
+
+
+# ---------------------------------------------------------------------------
+# 시장 규칙 (모듈): 제도가 바뀌거나 육지로 확대되면 여기에 규칙 세트를 추가·수정
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class MarketRules:
+    name: str
+    tolerance_pct: float          # 임밸런스 허용오차 (설비용량 대비 %)
+    min_output_ratio: float       # 발전량이 설비용량의 이 비율 미만이면 페널티 면제
+    shortfall_penalty: bool       # 모자람에도 페널티를 매기는지 (별표33: 아니오, 실시간 가격으로 정산)
+    max_segments: int             # 시간당 가격-수량 입찰 구간 수 상한
+    source: str
+
+
+MARKET_RULES = {
+    "제주": MarketRules("제주 시범사업 (전력시장운영규칙 별표 33)", 8.0, 0.10, False, 10,
+                       "별표 33 3.가.(2)(라): 허용오차 2024년까지 12%, 2025년까지 8% / 10% 미만 면제"),
+    "육지": MarketRules("육지 확대 시나리오 (가정: 제주 규칙 준용)", 8.0, 0.10, False, 10,
+                       "육지 입찰제도 정산 규칙이 확정되면 이 값을 바꾸세요"),
+}
+
+
+def market_config(market: str, tolerance_pct: float | None = None) -> "MarketConfig":
+    r = MARKET_RULES.get(market, MARKET_RULES["제주"])
+    return MarketConfig(tolerance_pct=r.tolerance_pct if tolerance_pct is None else tolerance_pct,
+                        min_output_ratio=r.min_output_ratio)
 
 
 # ---------------------------------------------------------------------------
@@ -61,113 +107,58 @@ def base_degradation_cost(b: BatteryConfig) -> float:
     return b.capex_won_per_kwh / (2 * b.cycle_life * dod)
 
 
-def stress_multiplier(soc: float, b: BatteryConfig) -> float:
-    """충전량이 너무 높거나 낮은 상태에서 쓰면 더 빨리 닳는다."""
-    return b.stress_factor if (soc < b.stress_low or soc > b.stress_high) else 1.0
+def rated_energy(b: BatteryConfig, cap_kw: float) -> float:
+    return b.energy_kwh if b.energy_kwh is not None else cap_kw * b.hours
 
 
-def penalty_cost(deviation_kwh, cap_kw, smp, m: MarketConfig):
-    """[가정] 허용범위(용량 × tolerance%)를 넘는 오차에 SMP × penalty_ratio 만큼 페널티.
-    경영 파트의 KPX 정산식이 나오면 이 함수만 바꾸면 된다."""
-    allowed = cap_kw * m.tolerance_pct / 100
-    excess = np.maximum(np.abs(deviation_kwh) - allowed, 0)
-    return excess * smp * m.penalty_ratio
+def soc_factor(soc, b: BatteryConfig):
+    """SoC 구간 계수: 20~80%는 1배, 그 밖으로 갈수록 선형 증가"""
+    s = np.clip(np.asarray(soc, dtype=float), 0.0, 1.0)
+    f = 1.0 + b.soc_lo_alpha * np.clip((0.2 - s) / 0.2, 0, 1) + b.soc_hi_alpha * np.clip((s - 0.8) / 0.2, 0, 1)
+    return f
 
 
-# ---------------------------------------------------------------------------
-# 시뮬레이션
-# ---------------------------------------------------------------------------
-STRATEGIES = {"none": "배터리 없음", "naive": "단순 운전", "aware": "감가 고려 (Voltics)"}
+def crate_factor(kwh_per_hour, b: BatteryConfig, cap_kw: float):
+    """C-rate 계수: 1시간에 움직인 양 ÷ 정격용량. 0.5C까지는 1배"""
+    Er = rated_energy(b, cap_kw)
+    C = np.asarray(kwh_per_hour, dtype=float) / Er if Er > 0 else 0.0
+    return 1.0 + b.crate_beta * np.maximum(C - 0.5, 0.0)
 
 
-def simulate(df: pd.DataFrame, b: BatteryConfig, m: MarketConfig, strategy: str) -> pd.DataFrame:
-    """df 컬럼: datetime, cap_kw, gen_kwh(실제), pred_kwh(예측), smp(원/kWh)
-    시간 순서대로 한 줄씩 배터리를 운전한다."""
-    df = df.sort_values("datetime").reset_index(drop=True)
-    cap = float(df["cap_kw"].iloc[0])
-    E = usable_energy(b, cap)             # 배터리 용량 (kWh)
-    P = b.power_kw if b.power_kw is not None else E * b.c_rate   # 시간당 최대 충방전량 (kWh)
-    eta = np.sqrt(b.efficiency)           # 충전·방전 각각의 효율
+def dod_factor(depth, b: BatteryConfig):
+    """방전깊이 계수: 80% 깊이를 기준(1배)으로, 수명 ∝ DoD^(-k) 관계에서 나오는 kWh당 감가 비율"""
+    d = np.clip(np.asarray(depth, dtype=float), 0.05, 1.0)
+    return (d / 0.8) ** (b.dod_k - 1.0)
+
+
+def plan_deg_cost(b: BatteryConfig, cap_kw: float, lo: float, hi: float, kwh_per_hour: float) -> float:
+    """계획·판단용 kWh당 감가: lo~hi 구간에서 kwh_per_hour 속도로 돌린다고 가정한 평균값"""
     c0 = base_degradation_cost(b)
-    allowed = cap * m.tolerance_pct / 100
+    if hi <= lo:
+        return float(c0 * soc_factor(lo, b) * crate_factor(kwh_per_hour, b, cap_kw))
+    avg_soc = float(np.mean(soc_factor(np.linspace(lo, hi, 21), b)))
+    return float(c0 * avg_soc * crate_factor(kwh_per_hour, b, cap_kw) * dod_factor(hi - lo, b))
 
-    bid = df["pred_kwh"].to_numpy() * m.bid_factor
-    act = df["gen_kwh"].to_numpy()
-    smp = df["smp"].to_numpy()
-    n = len(df)
 
-    soc = b.soc_init
-    out_soc, out_ch, out_dis, out_deg = np.zeros(n), np.zeros(n), np.zeros(n), np.zeros(n)
-    use_battery = strategy != "none" and E > 0
+def effective_deg_cost(b: BatteryConfig, cap_kw: float, reserve: float = 0.0) -> float:
+    """화면 표시용 대표 감가 (최대 출력으로, 예비분 위 구간을 쓴다고 가정)"""
+    E = usable_energy(b, cap_kw)
+    P = b.power_kw if b.power_kw is not None else E * b.c_rate
+    return plan_deg_cost(b, cap_kw, min(b.soc_min + reserve, b.soc_max), b.soc_max, P)
 
-    for t in range(n):
-        dev = act[t] - bid[t]                       # + 남음 / - 모자람
-        excess = abs(dev) - allowed                 # 페널티가 붙는 양
-        ch = dis = deg = 0.0
 
-        if use_battery and excess > 0:
-            avoided = smp[t] * m.penalty_ratio      # 1kWh 메울 때 아끼는 페널티
-            if dev > 0:                             # 남는다 → 충전
-                room = (b.soc_max - soc) * E / eta
-                amount = min(excess, P, max(room, 0))
-                if strategy == "aware":
-                    # 고스트레스 구간(너무 꽉 참)에 들어가지 않는 만큼만, 그리고 이득일 때만
-                    safe = max((b.stress_high - soc) * E / eta, 0)
-                    cost_safe = c0
-                    cost_stress = c0 * b.stress_factor
-                    amt_safe = min(amount, safe) if avoided > cost_safe else 0.0
-                    amt_stress = (amount - min(amount, safe)) if avoided > cost_stress else 0.0
-                    amount = amt_safe + amt_stress
-                    deg = amt_safe * cost_safe + amt_stress * cost_stress
-                else:
-                    deg = amount * c0 * stress_multiplier(soc, b)
-                ch = amount
-                soc += ch * eta / E
-            else:                                   # 모자란다 → 방전
-                avail = (soc - b.soc_min) * E * eta
-                amount = min(excess, P, max(avail, 0))
-                if strategy == "aware":
-                    safe = max((soc - b.stress_low) * E * eta, 0)
-                    cost_safe = c0
-                    cost_stress = c0 * b.stress_factor
-                    amt_safe = min(amount, safe) if avoided > cost_safe else 0.0
-                    amt_stress = (amount - min(amount, safe)) if avoided > cost_stress else 0.0
-                    amount = amt_safe + amt_stress
-                    deg = amt_safe * cost_safe + amt_stress * cost_stress
-                else:
-                    deg = amount * c0 * stress_multiplier(soc, b)
-                dis = amount
-                soc -= dis / eta / E
-
-        # 여유 충전: 페널티가 안 붙는 범위(허용오차) 안에서 발전량 일부를 미리 배터리에 채워 둔다.
-        #   단순 운전 → 최고 충전량까지 꽉 채움 / 감가 고려 → 열화가 적은 중간 구간(stress_high)까지만
-        if use_battery and act[t] > 0:
-            target = b.stress_high if strategy == "aware" else b.soc_max
-            margin = (act[t] - ch + dis - bid[t]) + allowed      # 이만큼까지는 덜 팔아도 페널티 없음
-            room = (target - soc) * E / eta
-            rec = max(min(P - ch - dis, room, margin, act[t] - ch), 0.0)
-            if strategy == "aware" and smp[t] * m.penalty_ratio <= c0:
-                rec = 0.0                                          # 나중에 아낄 페널티가 감가비용보다 작으면 안 채움
-            if rec > 0:
-                deg += rec * c0 * (1.0 if strategy == "aware" else stress_multiplier(soc, b))
-                ch += rec
-                soc += rec * eta / E
-
-        out_soc[t], out_ch[t], out_dis[t], out_deg[t] = soc, ch, dis, deg
-
-    delivered = act - out_ch + out_dis
-    remaining_dev = delivered - bid
-    res = df.copy()
-    res["bid_kwh"] = bid
-    res["charge_kwh"] = out_ch
-    res["discharge_kwh"] = out_dis
-    res["soc"] = out_soc
-    res["delivered_kwh"] = delivered
-    res["revenue"] = delivered * smp
-    res["penalty"] = penalty_cost(remaining_dev, cap, smp, m)
-    res["degradation"] = out_deg
-    res["net"] = res["revenue"] - res["penalty"] - res["degradation"]
-    return res
+def actual_deg_cost(b: BatteryConfig, cap_kw: float, charge, discharge, soc_path, soc_start) -> float:
+    """정산용 실제 감가: 시간마다 (기준 × SoC 계수 × C-rate 계수), 하루 전체에 DoD 계수"""
+    c0 = base_degradation_cost(b)
+    c, d = np.asarray(charge, float), np.asarray(discharge, float)
+    socs = np.asarray(soc_path, float)
+    prev = np.r_[soc_start, socs[:-1]]
+    mid = (prev + socs) / 2
+    hourly = (c + d) * c0 * soc_factor(mid, b) * crate_factor(c + d, b, cap_kw)
+    if hourly.sum() <= 0:
+        return 0.0
+    depth = max(np.max(np.r_[soc_start, socs]) - np.min(np.r_[soc_start, socs]), 0.05)
+    return float(hourly.sum() * dod_factor(depth, b))
 
 
 def usable_energy(b: BatteryConfig, cap_kw: float) -> float:
@@ -175,47 +166,12 @@ def usable_energy(b: BatteryConfig, cap_kw: float) -> float:
     return rated * b.soh
 
 
-def summarize(res: pd.DataFrame, b: BatteryConfig) -> dict:
-    cap = float(res["cap_kw"].iloc[0])
-    E = usable_energy(b, cap)
-    throughput = res["charge_kwh"].sum() + res["discharge_kwh"].sum()
-    cycles = throughput / (2 * E) if E > 0 else 0.0
-    # 수명 소모: cycle_life(80% DoD) 사이클을 다 쓰면 용량 100% → 80%
-    soh_drop = cycles / (b.cycle_life * 0.8) * 20 if E > 0 else 0.0
-    return {
-        "판매수익(원)": res["revenue"].sum(),
-        "페널티(원)": res["penalty"].sum(),
-        "배터리 감가비용(원)": res["degradation"].sum(),
-        "순수익(원)": res["net"].sum(),
-        "등가 사이클(회)": cycles,
-        "수명 소모(%p)": soh_drop,
-    }
-
-
-def compare(df: pd.DataFrame, b: BatteryConfig, m: MarketConfig):
-    """세 전략을 모두 돌려서 (요약표, 전략별 시간별 결과) 반환"""
-    runs = {k: simulate(df, b, m, k) for k in STRATEGIES}
-    table = pd.DataFrame({STRATEGIES[k]: summarize(r, b) for k, r in runs.items()}).T
-    return table, runs
-
-
-def scale_to_plant(df: pd.DataFrame, my_cap_kw: float) -> pd.DataFrame:
-    """지역 데이터(수십 MW)를 사업자 발전소 용량에 맞게 비율로 줄이거나 늘린다.
-    같은 지역이면 날씨가 비슷하니 '용량 대비 발전 비율(이용률)'은 같다고 본다."""
-    k = my_cap_kw / float(df["cap_kw"].iloc[0])
-    out = df.copy()
-    out["cap_kw"] = my_cap_kw
-    out["gen_kwh"] *= k
-    out["pred_kwh"] *= k
-    return out
-
-
 # 배터리 예시값 (실제 제품 사양이 아니라 일반적인 범위를 담은 시작값 — 사업자가 자기 값으로 바꿔 쓴다)
 PRESETS = {
     "직접 입력": None,
-    "LFP 표준형 (예시)":   dict(duration_h=2.0, efficiency=0.88, cycle_life=6000, capex=300_000, soh=1.00),
-    "NMC 고출력형 (예시)": dict(duration_h=1.0, efficiency=0.90, cycle_life=4000, capex=350_000, soh=1.00),
-    "사용 중 배터리 (예시)": dict(duration_h=2.0, efficiency=0.85, cycle_life=6000, capex=300_000, soh=0.85),
+    "LFP 표준형 (예시)":   dict(duration_h=2.0, efficiency=0.88, cycle_life=6000, capex=300_000, soh=1.00, chem="LFP"),
+    "NMC 고출력형 (예시)": dict(duration_h=1.0, efficiency=0.90, cycle_life=4000, capex=350_000, soh=1.00, chem="NMC"),
+    "사용 중 배터리 (예시)": dict(duration_h=2.0, efficiency=0.85, cycle_life=6000, capex=300_000, soh=0.85, chem="LFP"),
 }
 
 
@@ -243,7 +199,8 @@ def shrink_test_predictions(src_csv, dst_csv):
 #   - 모든 선택지에서 배터리가 닳는 비용(감가)을 뺀다
 # ---------------------------------------------------------------------------
 def decide_hour(promised_kwh, expected_kwh, price_now, future_prices, cap_kw,
-                b: BatteryConfig, soc_now: float, m: MarketConfig, reserve: float = 0.0):
+                b: BatteryConfig, soc_now: float, m: MarketConfig, reserve: float = 0.0,
+                export_cap: float | None = None):
     """이번 시간에 충전·방전·대기 중 무엇이 가장 이득인지.
 
     배터리 속 전기 1kWh의 가치 = 나중에 꺼내 팔 때 받을 돈 − 그때 닳는 비용
@@ -256,10 +213,19 @@ def decide_hour(promised_kwh, expected_kwh, price_now, future_prices, cap_kw,
     E = usable_energy(b, cap_kw)
     P = b.power_kw if b.power_kw is not None else E * b.c_rate
     eta = np.sqrt(b.efficiency)
-    c_deg = base_degradation_cost(b)
     allowed = cap_kw * m.tolerance_pct / 100
     future_best = max(future_prices) if len(future_prices) else 0.0
-    hold_value = max(future_best - c_deg, 0.0)              # 배터리에 남겨 둔 전기 1kWh의 가치
+    c_later = plan_deg_cost(b, cap_kw, min(b.soc_min + reserve, b.soc_max), b.soc_max, P)
+    c_deg = c_later                                       # 화면 표시용 대표값
+    hold_value = max(future_best - c_later, 0.0)          # 배터리에 남겨 둔 전기 1kWh의 가치 (나중에 꺼낼 때 감가 반영)
+    depth = max(b.soc_max - b.soc_min - reserve, 0.05)
+
+    def c_now(kwh, soc_after):
+        """지금 이 양을 움직일 때의 kWh당 감가: SoC 구간(지금~움직인 뒤) × C-rate × 평소 운전 깊이"""
+        if kwh <= 0 or E <= 0:
+            return 0.0
+        mid = (soc_now + soc_after) / 2
+        return float(base_degradation_cost(b) * soc_factor(mid, b) * crate_factor(kwh, b, cap_kw) * dod_factor(depth, b))
 
     dev = expected_kwh - promised_kwh                     # + 남음 / - 모자람
     shortfall = max(-dev, 0.0)
@@ -267,24 +233,36 @@ def decide_hour(promised_kwh, expected_kwh, price_now, future_prices, cap_kw,
     can_dis_extra = max(min(P, (soc_now - b.soc_min - reserve) * E * eta), 0.0)  # 예비 충전량은 남기고
     can_ch = max(min(P, (b.soc_max - soc_now) * E / eta), 0.0)
 
-    def settle(delivered):
-        """약속 대비 정산(이번 시간): 약속분 수익은 이미 확정이므로 '차이'에 대한 돈만 계산"""
+    def settle_parts(delivered):
+        """약속 대비 정산(이번 시간): 약속분 수익은 이미 확정이므로 '차이'에 대한 돈만 계산.
+        출력제어 중이면 허용 출력(export_cap)을 넘는 전기는 못 보내고 버려짐."""
+        if export_cap is not None:
+            delivered = min(delivered, export_cap)
         d = delivered - promised_kwh
         money = d * price_now                                   # 모자라면 -(사 오는 돈), 남으면 +(추가 판매)
-        over = max(d - allowed, 0.0)                            # 별표33: 약속보다 허용범위 넘게 더 보내면 페널티
-        return money - over * max(price_now, 0) * m.penalty_ratio
+        pen = float(penalty_over(d, cap_kw, price_now, m, delivered))   # 별표33: 허용범위 넘게 더 보내면 페널티(10% 미만 면제)
+        return money - pen, pen
 
-    options = [dict(action="대기", kwh=0.0, now=settle(expected_kwh), later=0.0, deg=0.0,
-                    why="배터리를 쓰지 않고 차이는 실시간 가격으로 정산해요.")]
+    def settle(delivered):
+        return settle_parts(delivered)[0]
+
+    options = [dict(action="대기", kwh=0.0, now=settle(expected_kwh), pen=settle_parts(expected_kwh)[1],
+                    later=0.0, deg=0.0, c_kwh=0.0,
+                    why=("배터리를 쓰지 않아요. 출력제어로 못 보내는 전기는 버려져요." if export_cap is not None
+                         else "배터리를 쓰지 않고 차이는 실시간 가격으로 정산해요."))]
 
     # 방전 후보: ① 모자란 만큼 메우기  ② 메우고 + 약속 안 한 추가 판매(허용범위 안, 예비 충전량 제외)
+    if export_cap is not None:
+        can_dis = can_dis_extra = 0.0                     # 출력제어 중엔 더 보낼 수 없으니 방전 의미 없음
     cover = min(can_dis, shortfall)
     extra = max(min(allowed, can_dis_extra - cover, P - cover), 0.0)
     best_d = None
     for x, kind in [(cover, "메우기"), (cover + extra, "추가 판매")]:
         if x <= 0:
             continue
-        o = dict(action="방전", kwh=x, now=settle(expected_kwh + x), later=-x * hold_value, deg=-x * c_deg)
+        cd = c_now(x, soc_now - x / eta / E if E > 0 else soc_now)
+        o = dict(action="방전", kwh=x, now=settle(expected_kwh + x), pen=settle_parts(expected_kwh + x)[1],
+                 later=-x * hold_value, deg=-x * cd, c_kwh=cd)
         o["total"] = o["now"] + o["later"] + o["deg"]
         sold = f"모자란 {min(x, shortfall):,.0f} kWh를 메우" if shortfall > 0 else ""
         add = x - min(x, shortfall)
@@ -305,7 +283,9 @@ def decide_hour(promised_kwh, expected_kwh, price_now, future_prices, cap_kw,
             if y <= 0:
                 continue
             out = y * eta * eta
-            o = dict(action="충전", kwh=y, now=settle(expected_kwh - y), later=out * hold_value, deg=-y * c_deg,
+            cc = c_now(y, soc_now + y * eta / E if E > 0 else soc_now)
+            o = dict(action="충전", kwh=y, now=settle(expected_kwh - y), pen=settle_parts(expected_kwh - y)[1],
+                     later=out * hold_value, deg=-y * cc, c_kwh=cc,
                      why=f"지금 {price_now:,.0f}원에 팔지 않고 담아 뒀다가 앞으로 최고가 {future_best:,.0f}원일 때 팔아요 "
                          f"(효율 손실 {1 - b.efficiency:.0%}, 넣을 때·뺄 때 모두 감가 반영).")
             o["total"] = o["now"] + o["later"] + o["deg"]
@@ -317,7 +297,26 @@ def decide_hour(promised_kwh, expected_kwh, price_now, future_prices, cap_kw,
     table = pd.DataFrame(options)
     table["total"] = table["now"] + table["later"] + table["deg"]
     best = table.loc[table["total"].idxmax()]
-    info = dict(dev=dev, c_deg=c_deg, future_best=future_best, hold_value=hold_value, allowed=allowed,
+    eta2 = b.efficiency
+    if best.action == "충전":
+        cc = best.c_kwh
+        lost = 0.0 if (export_cap is not None and expected_kwh > (export_cap or 0)) else price_now
+        why_now = dict(a=("지금 팔면 kWh당" if lost else "지금 못 보내서 버리면 kWh당", lost),
+                       b=("담았다 나중에 팔면 kWh당", eta2 * hold_value - cc))
+    elif best.action == "방전":
+        why_now = dict(a=("지금 꺼내 쓰면 kWh당", price_now - best.c_kwh), b=("아껴 뒀다 나중에 쓰면 kWh당", hold_value))
+    else:
+        alt_c = table[table.action == "충전"]
+        alt_d = table[table.action == "방전"]
+        if len(alt_d):
+            why_now = dict(a=("지금 꺼내 쓰면 kWh당", price_now - float(alt_d.c_kwh.iloc[0])),
+                           b=("아껴 뒀다 나중에 쓰면 kWh당", hold_value))
+        elif len(alt_c):
+            why_now = dict(a=("지금 팔면 kWh당", price_now),
+                           b=("담았다 나중에 팔면 kWh당", eta2 * hold_value - float(alt_c.c_kwh.iloc[0])))
+        else:
+            why_now = None
+    info = dict(why_now=why_now, dev=dev, c_deg=c_deg, future_best=future_best, hold_value=hold_value, allowed=allowed,
                 can_dis=can_dis, can_dis_extra=can_dis_extra, can_ch=can_ch, reserve=reserve)
     return best, table, info
 
@@ -369,11 +368,11 @@ def plan_day(gen_kwh, price, b: BatteryConfig, cap_kw, soc_start=0.5, reserve=0.
     E = usable_energy(b, cap_kw)
     P = b.power_kw if b.power_kw is not None else E * b.c_rate
     eta = np.sqrt(b.efficiency)
-    c_deg = base_degradation_cost(b)
     soc0 = min(max(soc_start, 0.0), 1.0)
     # 하한 = 최저 충전량 + 예비분. 단, 지금 충전량이 그보다 낮으면 '지금보다 더 쓰지 않기'까지만 요구
     lo = min(b.soc_min + reserve, b.soc_max, soc0)
     hi = max(b.soc_max, soc0)
+    c_deg = plan_deg_cost(b, cap_kw, lo, hi, P)     # 이 구간·이 속도로 돌릴 때의 kWh당 평균 감가 (비선형 반영)
 
     if E <= 0 or P <= 0:
         c = d = np.zeros(n)
@@ -532,19 +531,23 @@ def settle_actual(bid, actual_gen, charge, discharge, price, cap_kw, b: BatteryC
         socs[t] = soc
     delivered = actual_gen - c + d
     revenue = delivered * price
-    penalty = penalty_over(delivered - bid, cap_kw, price, m)
-    deg = (c + d) * base_degradation_cost(b)
+    penalty = penalty_over(delivered - bid, cap_kw, price, m, delivered)
+    deg_total = actual_deg_cost(b, cap_kw, c, d, socs, soc_start)
     return dict(delivered=delivered, charge=c, discharge=d, soc=socs, soc_end=float(soc),
-                revenue=float(revenue.sum()), penalty=float(penalty.sum()), degradation=float(deg.sum()),
-                net=float(revenue.sum() - penalty.sum() - deg.sum()))
+                revenue=float(revenue.sum()), penalty=float(penalty.sum()), degradation=deg_total,
+                net=float(revenue.sum() - penalty.sum() - deg_total))
 
 
-def penalty_over(diff_kwh, cap_kw, price, m: MarketConfig):
+def penalty_over(diff_kwh, cap_kw, price, m: MarketConfig, delivered=None):
     """별표33 방식: 약속보다 허용범위(용량 × tolerance%)를 넘게 '더' 보낸 양에만 페널티.
-    모자란 양은 페널티 없이 실시간 가격으로 정산(여기선 같은 가격으로 이미 반영)."""
+    모자란 양은 페널티 없이 실시간 가격으로 정산(여기선 같은 가격으로 이미 반영).
+    발전량(delivered)이 설비용량의 min_output_ratio 미만인 시간은 면제."""
     allowed = cap_kw * m.tolerance_pct / 100
-    over = np.maximum(np.asarray(diff_kwh) - allowed, 0)
-    return over * np.maximum(price, 0) * m.penalty_ratio
+    over = np.maximum(np.asarray(diff_kwh, dtype=float) - allowed, 0)
+    pen = over * np.maximum(price, 0) * m.penalty_ratio
+    if delivered is not None:
+        pen = np.where(np.asarray(delivered, dtype=float) < cap_kw * m.min_output_ratio, 0.0, pen)
+    return pen
 
 
 # ---------------------------------------------------------------------------
@@ -563,6 +566,28 @@ def _expected_price_fast(mat, daily_cf, D, target_cf, k=10, window=30):
         return mat.loc[diff.index[:k]].mean().values
     recent = past[past >= D - pd.Timedelta(days=7)]
     return mat.loc[recent].mean().values if len(recent) else mat.loc[past].mean().values
+
+
+def rule_plan(gen_forecast, b: BatteryConfig, cap_kw, soc_start=0.5, reserve=0.1,
+              charge_hours=range(10, 15), discharge_hours=range(18, 22)):
+    """현장에서 흔한 단순 규칙: 낮(10~14시)엔 발전량으로 최대한 충전, 저녁(18~21시)엔 최대한 방전.
+    가격·감가는 보지 않음. 입찰은 '예측 − 충전 계획 + 방전 계획' 수량으로."""
+    g = np.asarray(gen_forecast, dtype=float)
+    E = usable_energy(b, cap_kw)
+    P = b.power_kw if b.power_kw is not None else E * b.c_rate
+    eta = np.sqrt(b.efficiency)
+    soc = soc_start
+    c, d = np.zeros(len(g)), np.zeros(len(g))
+    for t in range(len(g)):
+        if E <= 0:
+            break
+        if t in charge_hours:
+            c[t] = min(P, g[t], max((b.soc_max - soc) * E / eta, 0))
+            soc += c[t] * eta / E
+        elif t in discharge_hours:
+            d[t] = min(P, max((soc - b.soc_min - reserve) * E * eta, 0))
+            soc -= d[t] / eta / E
+    return c, d
 
 
 def backtest_year(hcf, prices_long, cap_kw, b: BatteryConfig, m: MarketConfig, reserve=0.1,
@@ -610,6 +635,12 @@ def backtest_year(hcf, prices_long, cap_kw, b: BatteryConfig, m: MarketConfig, r
             row[f"{k}_pen"] = r["penalty"]
             row[f"{k}_deg"] = r["degradation"]
             row[f"{k}_moved"] = float(r["charge"].sum() + r["discharge"].sum())
+        # 단순 규칙 (낮 충전·저녁 방전)
+        rc, rd = rule_plan(pred, b, cap_kw, soc.get("rule", (b.soc_min + b.soc_max) / 2), reserve)
+        r = settle_actual(pred - rc + rd, act, rc, rd, price, cap_kw, b, m, soc.get("rule", (b.soc_min + b.soc_max) / 2))
+        soc["rule"] = r["soc_end"]
+        row["rule"], row["rule_pen"], row["rule_deg"] = r["net"], r["penalty"], r["degradation"]
+        row["rule_moved"] = float(r["charge"].sum() + r["discharge"].sum())
         # Voltics 가격-수량 입찰 (전날 정보만으로 조건부 주문)
         cv = bid_curve(pred, exp_p, b, cap_kw, soc["curve"], reserve)
         r = settle_curve(cv, act, price, b, cap_kw, m, soc["curve"], reserve)
@@ -631,18 +662,24 @@ def backtest_year(hcf, prices_long, cap_kw, b: BatteryConfig, m: MarketConfig, r
 #   ② 담기 기준가  = η²·V − c          (지금 가격이 이보다 싸면 파는 것보다 담는 게 이득)
 #   ③ 꺼내기 기준가 = c + (그 뒤 시간에 꺼내 팔 가치)  (뒤로 갈수록 낮아짐)
 # ---------------------------------------------------------------------------
-def bid_curve(gen_forecast, exp_prices, b: BatteryConfig, cap_kw, soc_start=0.5, reserve=0.1):
+def bid_curve(gen_forecast, exp_prices, b: BatteryConfig, cap_kw, soc_start=0.5, reserve=0.1, curtail_hours=()):
+    """curtail_hours: 출력제어가 예고된 시간 → 그 시간 발전량은 팔 수 없으니 배터리에 담는 걸 최우선으로"""
     g = np.asarray(gen_forecast, dtype=float)
     p = np.asarray(exp_prices, dtype=float)
     n = len(g)
     E = usable_energy(b, cap_kw)
     P = b.power_kw if b.power_kw is not None else E * b.c_rate
     eta2 = b.efficiency
-    c = base_degradation_cost(b)
+    c = plan_deg_cost(b, cap_kw, min(b.soc_min + reserve, b.soc_max), b.soc_max, P)   # 비선형 감가(구간·속도 평균)
     E_room = max(E * (b.soc_max - b.soc_min - reserve), 0.0)          # 하루에 굴릴 수 있는 에너지
 
     q_base, q_store, q_dis = g.copy(), np.zeros(n), np.zeros(n)
+    p_base = np.zeros(n)
     p_store, p_dis = np.full(n, np.nan), np.full(n, np.nan)
+    curt = set(int(h) for h in curtail_hours)
+    for h in curt:                                   # 출력제어: 기본 판매 안 함
+        q_base[h], p_base[h] = 0.0, np.inf
+    thr_store = np.nan
     if E > 0 and P > 0 and E_room > 0:
         # 꺼내 팔 시간: 예상 가격이 높은 순서로, 하루 굴릴 에너지만큼
         dis_hours, cum = [], 0.0
@@ -654,58 +691,73 @@ def bid_curve(gen_forecast, exp_prices, b: BatteryConfig, cap_kw, soc_start=0.5,
         dis_hours = sorted(dis_hours)
         V = max(np.mean(p[dis_hours]) - c, 0.0)
         thr_store = eta2 * V - c
-        # 담을 시간: 발전하는 시간 중 예상 가격이 낮은 순서로
+        # 담을 시간: 출력제어 시간 먼저(버려질 전기라 담는 게 거의 항상 이득), 그다음 예상 가격이 낮은 순서로
         if thr_store > 0:
             cum = 0.0
-            for h in sorted([h for h in range(n) if g[h] > 0], key=lambda h: p[h]):
+            order = sorted([h for h in curt if g[h] > 0]) + sorted([h for h in range(n) if g[h] > 0 and h not in curt],
+                                                                    key=lambda h: p[h])
+            for h in order:
                 if cum >= E_room / np.sqrt(eta2):
                     break
                 q = min(P, g[h], E_room / np.sqrt(eta2) - cum)
-                q_store[h], p_store[h] = q, thr_store
-                q_base[h] -= q
+                q_store[h], p_store[h] = q, (np.inf if h in curt else thr_store)
+                if h not in curt:
+                    q_base[h] -= q
                 cum += q
         # 꺼내기 기준가: 감가 + (그 뒤 꺼내 팔 시간의 가치 중 최고)
+        dis_hours = [h for h in dis_hours if h not in curt]
         for i, h in enumerate(dis_hours):
             later = [p[k] - c for k in dis_hours[i + 1:]]
             p_dis[h] = c + max(max(later) if later else 0.0, 0.0)
             q_dis[h] = P
-    return pd.DataFrame({"q_base": q_base, "p_base": 0.0, "q_store": q_store, "p_store": p_store,
-                         "q_dis": q_dis, "p_dis": p_dis})
+    return pd.DataFrame({"q_base": q_base, "p_base": p_base, "q_store": q_store, "p_store": p_store,
+                         "q_dis": q_dis, "p_dis": p_dis,
+                         "v_store": thr_store if (thr_store == thr_store and thr_store > 0) else np.nan,
+                         "curtail": [h in curt for h in range(n)]})
 
 
 def settle_curve(curve: pd.DataFrame, actual_gen, price, b: BatteryConfig, cap_kw, m: MarketConfig,
                  soc_start=0.5, reserve=0.1):
-    """가격이 정해지면 각 구간이 팔렸는지(낙찰) 보고, 실제 발전량·배터리 상태로 정산"""
+    """가격이 정해지면 각 구간이 팔렸는지(낙찰) 보고, 실제 발전량·배터리 상태로 정산.
+    - 기본 판매가 안 팔린 시간(마이너스 가격·출력제어)은 약속량 넘게 못 보냄 → 남는 전기는 배터리에 담고 나머지는 출력 감축
+    - 담는 게 이득인지는 '담은 전기의 가치(v_store)'와 지금 가격을 비교"""
     E = usable_energy(b, cap_kw)
+    P = b.power_kw if b.power_kw is not None else E * b.c_rate
     eta = np.sqrt(b.efficiency)
     n = len(price)
     soc = min(max(soc_start, 0.0), 1.0)
+    p_base = np.asarray(curve["p_base"], dtype=float) if "p_base" in curve else np.zeros(n)
+    v_store = float(curve["v_store"].iloc[0]) if "v_store" in curve and curve["v_store"].notna().any() else np.nan
     bid, c, d, delivered, socs = np.zeros(n), np.zeros(n), np.zeros(n), np.zeros(n), np.zeros(n)
     for t in range(n):
         pr = price[t]
-        sold_base = curve.q_base[t] if pr >= curve.p_base[t] else 0.0
+        base_ok = pr >= p_base[t]
+        sold_base = curve.q_base[t] if base_ok else 0.0
         sold_store = curve.q_store[t] if (curve.q_store[t] > 0 and pr >= curve.p_store[t]) else 0.0
         want_dis = curve.q_dis[t] if (curve.q_dis[t] > 0 and pr >= curve.p_dis[t]) else 0.0
         if E > 0:
-            if curve.q_store[t] > 0 and sold_store == 0:          # 담을 몫이 안 팔림 → 배터리에 담기
+            can_take = curve.q_store[t] - sold_store                       # 안 팔린 '담을 몫'
+            if not base_ok and v_store == v_store and pr < v_store:        # 기본 판매도 안 팔렸으면 그것도 담기
+                can_take += curve.q_base[t]
+            if can_take > 0:
                 room = max((b.soc_max - soc) * E / eta, 0.0)
-                c[t] = min(curve.q_store[t], actual_gen[t], room)
+                c[t] = min(can_take, actual_gen[t], room, P)
                 soc += c[t] * eta / E
             avail = max((soc - b.soc_min - reserve) * E * eta, 0.0)
-            d[t] = min(want_dis, avail)
+            d[t] = min(want_dis, avail, P)
             soc -= d[t] / eta / E
         bid[t] = sold_base + sold_store + d[t]                     # 꺼낼 수 없는 몫은 애초에 약속 안 한 걸로
         out = actual_gen[t] - c[t] + d[t]
-        if pr < 0:                                                 # 마이너스 가격: 약속보다 더 보내지 않게 출력 줄임
+        if not base_ok:                                            # 마이너스 가격·출력제어: 약속보다 더 보내지 않게 출력 감축
             out = min(out, bid[t])
         delivered[t] = out
         socs[t] = soc
     revenue = delivered * price
-    penalty = penalty_over(delivered - bid, cap_kw, price, m)
-    deg = (c + d) * base_degradation_cost(b)
+    penalty = penalty_over(delivered - bid, cap_kw, price, m, delivered)
+    deg_total = actual_deg_cost(b, cap_kw, c, d, socs, soc_start)
     return dict(bid=bid, delivered=delivered, charge=c, discharge=d, soc=socs, soc_end=float(soc),
-                revenue=float(revenue.sum()), penalty=float(penalty.sum()), degradation=float(deg.sum()),
-                net=float(revenue.sum() - penalty.sum() - deg.sum()))
+                revenue=float(revenue.sum()), penalty=float(penalty.sum()), degradation=deg_total,
+                net=float(revenue.sum() - penalty.sum() - deg_total))
 
 
 def curve_table(curve: pd.DataFrame, gen_forecast, exp_prices, b: BatteryConfig, cap_kw, soc_start=0.5, reserve=0.1):
@@ -713,12 +765,13 @@ def curve_table(curve: pd.DataFrame, gen_forecast, exp_prices, b: BatteryConfig,
     exp = settle_curve(curve, np.asarray(gen_forecast, float), np.asarray(exp_prices, float), b, cap_kw,
                        MarketConfig(), soc_start, reserve)
     def f(x):
-        return np.where(np.isnan(x), np.nan, np.round(x, 1))
+        x = np.asarray(x, dtype=float)
+        return np.where(np.isfinite(x), np.round(x, 1), np.nan)
     t = pd.DataFrame({
         "시간": [f"{h:02d}시" for h in range(len(curve))],
         "AI 예측 발전량(kWh)": np.round(gen_forecast, 0),
         "예상 가격(원/kWh)": np.round(exp_prices, 1),
-        "①기본판매 가격(원)": curve["p_base"].where(curve["q_base"] > 0).round(1),
+        "①기본판매 가격(원)": f(curve["p_base"].where(curve["q_base"] > 0).values),
         "①기본판매 수량(kWh)": curve["q_base"].round(0),
         "②담을몫 가격(원)": f(curve["p_store"].values),
         "②담을몫 수량(kWh)": curve["q_store"].round(0),
@@ -726,5 +779,17 @@ def curve_table(curve: pd.DataFrame, gen_forecast, exp_prices, b: BatteryConfig,
         "③배터리판매 수량(kWh)": curve["q_dis"].round(0),
         "예상 낙찰량(kWh)": np.round(exp["bid"], 0),
         "예상 SOC(%)": np.round(exp["soc"] * 100, 0),
+        "출력제어": np.where(curve["curtail"] if "curtail" in curve else False, "Y", ""),
+        "담기 가치(원/kWh)": f(curve["v_store"].values if "v_store" in curve else np.full(len(curve), np.nan)),
     })
     return t, exp
+
+
+def fallback_generation(hist: pd.DataFrame, sites, cap_kw, target_date, window_days=20) -> pd.DataFrame:
+    """[백업] 기상청 예보를 못 받을 때: 과거 같은 계절(±window_days) 실측 발전의 시간대별 중앙값으로 내일 발전량 추정"""
+    h = hist[hist["site"].isin(sites)].copy()
+    h["cf"] = h["gen_kwh"] / h["cap_kw"]
+    h = h[_doy_window(h["datetime"].dt.normalize(), target_date, window_days)]
+    prof = h.groupby(h["datetime"].dt.hour)["cf"].median().reindex(range(24)).fillna(0)
+    d0 = pd.Timestamp(target_date)
+    return pd.DataFrame({"datetime": d0 + pd.to_timedelta(range(24), unit="h"), "pred_kwh": prof.values * cap_kw})
