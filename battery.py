@@ -290,8 +290,11 @@ def decide_hour(promised_kwh, expected_kwh, price_now, future_prices, cap_kw,
             cc = c_now(y, soc_now + y * eta / E if E > 0 else soc_now)
             o = dict(action="충전", kwh=y, now=settle(expected_kwh - y), pen=settle_parts(expected_kwh - y)[1],
                      later=out * hold_value, deg=-y * cc, c_kwh=cc,
-                     why=f"지금 {price_now:,.0f}원에 팔지 않고 담아 뒀다가 앞으로 최고가 {future_best:,.0f}원일 때 팔아요 "
-                         f"(효율 손실 {1 - b.efficiency:.0%}, 넣을 때·뺄 때 모두 감가 반영).")
+                     why=(f"약속보다 더 나온 전기 중 허용범위({allowed:,.0f} kWh)를 넘는 양은 지금 팔아도 정산금이 환수돼요. "
+                          f"그만큼 {y:,.0f} kWh를 배터리에 담아 뒀다가 앞으로 최고가 {future_best:,.0f}원일 때 팔아요."
+                          if settle_parts(expected_kwh)[1] - settle_parts(expected_kwh - y)[1] > 0.5 * y * max(price_now, 0)
+                          else f"지금 {price_now:,.0f}원에 파는 것보다, 담아 뒀다가 앞으로 최고가 {future_best:,.0f}원일 때 파는 게 "
+                               f"효율 손실({1 - b.efficiency:.0%})과 감가를 빼도 더 이득이에요."))
             o["total"] = o["now"] + o["later"] + o["deg"]
             if best_c is None or o["total"] > best_c["total"]:
                 best_c = o
