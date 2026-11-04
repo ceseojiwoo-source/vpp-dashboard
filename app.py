@@ -167,11 +167,11 @@ with st.sidebar:
             "**지금 Voltics가 하는 일 (의사결정 지원)**\n"
             "- 내일 가격-수량 입찰표 생성 · CSV 내보내기\n"
             "- 당일 충전/방전/대기 판단과 근거 제시\n"
-            "- 운영 지시값(JSON) 내보내기 예시\n\n"
+            "\n"
             "**지금 하지 않는 일**\n"
             "- 전력거래소에 입찰을 자동 제출하지 않아요 (사업자가 확인 후 제출)\n"
             "- 배터리 EMS/PCS에 제어 신호를 직접 보내지 않아요\n\n"
-            "**다음 단계 (로드맵)**: EMS 연동 API로 지시값 자동 전달, 입찰 자동 제출 연동"
+            "**다음 단계 (로드맵)**: 배터리 EMS 자동 연동, 입찰 자동 제출 연동"
         )
 
 DEG_KW = dict(chem=chem, soc_lo_alpha=soc_lo_a, soc_hi_alpha=soc_hi_a, dod_k=dod_k, crate_beta=crate_b)
@@ -586,15 +586,6 @@ def render_realtime():
     st.caption("이번 시간 정산 = (실제로 보낸 양 − 약속량) × 지금 가격 − 초과 페널티. "
                "약속량만큼의 수익은 하루 전에 이미 확정돼서 여기선 '차이'만 계산해요. "
                "페널티(허용범위를 넘게 더 보냄)와 배터리 감가를 같은 표에서 비교해서 더 싼 쪽을 골라요.")
-    import json
-    ems = {"time": f"{hour:02d}:00-{hour + 1:02d}:00", "action": {"충전": "CHARGE", "방전": "DISCHARGE", "대기": "IDLE"}[best.action],
-           "energy_kwh": round(float(best.kwh), 1), "power_limit_kw": round(float(power), 1),
-           "soc_min_pct": round(bcfg.soc_min * 100), "soc_max_pct": round(bcfg.soc_max * 100),
-           "export_cap_kwh": export_cap, "reason": best.why}
-    st.download_button("📤 운영 지시값 내보내기 (EMS 연동용 JSON 예시)", json.dumps(ems, ensure_ascii=False, indent=2).encode("utf-8"),
-                       file_name=f"voltics_setpoint_{hour:02d}.json", mime="application/json",
-                       help="지금은 사업자가 확인 후 직접 반영해요. 향후 EMS와 API로 연결하면 이 값이 자동으로 전달돼요.")
-
     chart = pd.DataFrame({"가격(원/kWh)": day_prices.values}, index=[f"{h:02d}시" for h in range(24)])
     chart.loc[f"{hour:02d}시", "가격(원/kWh)"] = price_now
     st.caption(f"가격 흐름 · {price_label} (지금 시간은 실시간 가격으로 바꿔서 표시)")
