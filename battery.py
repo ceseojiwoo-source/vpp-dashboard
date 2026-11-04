@@ -366,6 +366,8 @@ def plan_day(gen_kwh, price, b: BatteryConfig, cap_kw, soc_start=0.5, reserve=0.
 
     g = np.asarray(gen_kwh, dtype=float)
     p = np.asarray(price, dtype=float)
+    g = np.nan_to_num(g, nan=0.0)
+    p = np.nan_to_num(p, nan=float(np.nanmean(p)) if np.isfinite(p).any() else 0.0, posinf=0.0, neginf=0.0)
     n = len(g)
     E = usable_energy(b, cap_kw)
     P = b.power_kw if b.power_kw is not None else E * b.c_rate
@@ -567,7 +569,11 @@ def _expected_price_fast(mat, daily_cf, D, target_cf, k=10, window=30):
         diff = (daily_cf.loc[pool] - target_cf).abs().sort_values()
         return mat.loc[diff.index[:k]].mean().values
     recent = past[past >= D - pd.Timedelta(days=7)]
-    return mat.loc[recent].mean().values if len(recent) else mat.loc[past].mean().values
+    if len(recent):
+        return mat.loc[recent].mean().values
+    if len(past):
+        return mat.loc[past].mean().values
+    return None   # 가격 파일에 이 날 이전 기록이 없음 → 전날 정보로 계획할 수 없어 건너뜀
 
 
 def rule_plan(gen_forecast, b: BatteryConfig, cap_kw, soc_start=0.5, reserve=0.1,
@@ -625,6 +631,9 @@ def backtest_year(hcf, prices_long, cap_kw, b: BatteryConfig, m: MarketConfig, r
         act = piv_a.loc[D].values * cap_kw
         price = mat.loc[D].values
         exp_p = _expected_price_fast(mat, daily["cf_act"], D, daily.loc[D, "cf_pred"])
+        if exp_p is None or not np.isfinite(price).all() or not np.isfinite(pred).all():
+            continue
+        exp_p = np.nan_to_num(exp_p, nan=float(np.nanmean(exp_p)) if np.isfinite(exp_p).any() else 0.0)
         none = settle_actual(pred, act, np.zeros(24), np.zeros(24), price, cap_kw, b, m)
         row = {"date": D, "none": none["net"], "none_pen": none["penalty"]}
         for k, bb in plan_cfg.items():
@@ -650,6 +659,9 @@ def backtest_year(hcf, prices_long, cap_kw, b: BatteryConfig, m: MarketConfig, r
         row["curve"], row["curve_pen"], row["curve_deg"] = r["net"], r["penalty"], r["degradation"]
         row["curve_moved"] = float(r["charge"].sum() + r["discharge"].sum())
         rows.append(row)
+    if not rows:
+        raise ValueError("가격 파일에 백테스트 기간 이전 날짜가 없어 전날 가격 예측을 할 수 없어요. "
+                         "기간 시작일보다 며칠 앞선 가격까지 포함된 파일을 올려 주세요.")
     return pd.DataFrame(rows).set_index("date")
 
 
