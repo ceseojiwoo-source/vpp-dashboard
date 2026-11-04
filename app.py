@@ -723,6 +723,13 @@ def render_replay():
                        "AI 예측값은 AI 모델의 2025년 검증 결과(그날 관측된 기온·습도·바람·비 입력)라서, "
                        "실제 전날 예보로 예측했을 때보다 조금 더 정확하게 나올 수 있어요.")
 
+        with st.expander("이날 전날에 낸 가격-수량 입찰표 보기"):
+            tbl_r, _ = bt.curve_table(curve_r, pred, exp_p.values, bcfg, capacity, 0.5, reserve_r)
+            used = (tbl_r["②담을몫 수량(kWh)"] > 0) | (tbl_r["③배터리판매 수량(kWh)"] > 0)
+            st.dataframe(tbl_r[used] if used.any() else tbl_r, use_container_width=True, hide_index=True)
+            st.caption("②담을몫: 이 가격보다 싸면 팔지 않고 배터리에 담음 · ③배터리판매: 이 가격 이상이면 배터리에서 꺼내 팖. "
+                       "배터리 조건을 건 시간만 보여 줘요.")
+
 
 with tab5:
     render_replay()
