@@ -139,12 +139,20 @@ with st.sidebar:
     else:
         st.warning("📍 육지 발전소 → **육지 가격** 적용 · 입찰제도 **확대 대비 시나리오**", icon="🧭")
     st.link_button("📈 전력거래소 시간별 SMP 바로가기", EPSIS_URL, use_container_width=True)
-    st.caption("구분(제주/육지)과 기간(**2023년 1월 ~ 오늘** 권장)을 고르고 **조회 → CSV**로 받아서 맞는 칸에 올려 주세요.")
+    st.caption("구분(제주/육지)과 기간을 고르고 **조회 → CSV**로 받아서 맞는 칸에 올려 주세요. "
+               "**오늘 운영 판단에는 최근 며칠~오늘**만 있으면 돼요. 올린 파일에 없는 날짜는 기본 가격 파일(2023.1~)로 채워서 "
+               "'과거 날짜 재현'(2025년)도 그대로 작동해요.")
     all_prices = {}
     for mk in ["제주", "육지"]:
         up = st.file_uploader(f"{mk} 시간별 SMP CSV", type=["csv"], key=f"up_{mk}")
         if up is not None:
-            all_prices[mk] = load_price_file(up.getvalue())
+            new_p = load_price_file(up.getvalue())
+            if PRICE_FILES[mk].exists():
+                # 올린 파일에 없는 날짜(예: 2025년)는 기본 파일로 채움 → 과거 날짜 재현도 계속 작동
+                base_p = load_price_file(PRICE_FILES[mk].read_bytes())
+                base_p = base_p[~base_p["date"].isin(new_p["date"].unique())]
+                new_p = pd.concat([base_p, new_p]).sort_values(["date", "hour"]).reset_index(drop=True)
+            all_prices[mk] = new_p
         elif PRICE_FILES[mk].exists():
             all_prices[mk] = load_price_file(PRICE_FILES[mk].read_bytes())
     prices = all_prices.get(market)
@@ -173,8 +181,8 @@ bcfg = bt.BatteryConfig(energy_kwh=energy, power_kw=power, soh=soh, efficiency=e
 RULES = bt.MARKET_RULES[market]
 
 
-tab1, tab4, tab5, tab3, tab2 = st.tabs(
-    ["☀️ 내일 발전량 예측", "⚡ 실시간 운영 판단", "⏪ 과거 날짜 재현", "📈 1년 성과 리포트", "📊 AI 예측 정확도"])
+tab1, tab4, tab5 = st.tabs(
+    ["☀️ 내일 발전량 예측", "⚡ 실시간 운영 판단", "⏪ 과거 날짜 재현"])
 
 # ---------- 탭 1: 내일 예측 ----------
 with tab1:
@@ -382,21 +390,7 @@ with tab1:
             st.caption("실제 전력거래소 입찰은 시간마다 최대 10구간까지 가격-수량을 낼 수 있어요. Voltics는 3구간(기본 판매·담을 몫·배터리 판매)을 써요.")
         st.caption("내일이 되면 '⚡ 실시간 운영 판단' 탭에 이 CSV를 올리세요. 확정된 가격으로 각 시간 낙찰량(약속량)을 자동 계산해 줘요.")
 
-# ---------- 탭 2: 모델 성능 ----------
-with tab2:
-    m = get_metrics()
-    st.subheader("AI 발전량 예측 정확도 (2025년 1년 검증)")
-    st.caption("오차율 = |예측 − 실제| ÷ 설비용량 (낮 시간 평균). 낮을수록 정확해요. "
-               "흐린 날에 실제보다 많게 예측하는 경향이 있어서, Voltics는 비 예보가 있으면 배터리를 더 남겨 둬요.")
-    mb = m[m["모델"] == "B_예보대응"][["지역", "용량기준 오차율(%)"]].set_index("지역")
-    mb.columns = ["오차율 (%)"]
-    st.bar_chart(mb)
-    st.dataframe(mb.round(1), use_container_width=True)
-    st.caption("학습 데이터: 한국수력원자력 태양광 5개 지역 51기(약 70.7MW) 2023~2025년 시간별 실측 + 기상청 관측. "
-               "고객 발전소 실측 데이터가 쌓이면 발전소별로 보정해요.")
-
-
-# ---------- 탭 3: 1년 성과 리포트 (탭 1·4·5와 같은 규칙) ----------
+# ---------- 공통 도우미 (과거 날짜 재현에서 사용) ----------
 def region_hourly_cf(hist_all, sites):
     """과거 실측 → 날짜·시간별 이용률 (AI 예측 / 실제), 여러 지역이면 평균"""
     hh = hist_all[hist_all["site"].isin(sites)].copy()
@@ -407,105 +401,6 @@ def region_hourly_cf(hist_all, sites):
     return hh.groupby(["date", "hour"])[["cf_pred", "cf_act"]].mean().reset_index()
 
 
-@st.cache_data(show_spinner="1년치 입찰·정산을 하루씩 다시 계산하는 중... (몇 초 걸려요)")
-def run_backtest(hcf, prices_long, cap_kw, b_kwargs, mkt, tol, reserve, margin, start, end):
-    return bt.backtest_year(hcf, prices_long, cap_kw, bt.BatteryConfig(**b_kwargs),
-                            bt.market_config(mkt, tol), reserve, start, end, margin)
-
-
-def won(x):
-    return f"{x / 10_000:+,.0f}만 원" if abs(x) >= 5_000 else "±0만 원"
-
-
-with tab3:
-    st.subheader("이 엔진을 2025년 1년 동안 썼다면? (성과 리포트)")
-    st.caption(
-        "매일 **전날 알 수 있었던 정보로 입찰** → **그날 실제 발전량·실제 가격으로 정산**을 1년 동안 반복했어요. "
-        "배터리 상태는 다음 날로 이어지고, 실제로 닳은 만큼 감가비용을 빼요. "
-        f"위치·용량·배터리·가격({market})은 왼쪽 사이드바 설정을 그대로 써요."
-    )
-    hist_all3 = load_hist()
-    if hist_all3 is None or prices is None or not len(prices):
-        st.warning("성과 리포트를 만들려면 과거 발전 데이터와 왼쪽 '전기 가격'의 가격 데이터가 필요해요.")
-    else:
-        rs3 = reference_sites(lat, lon, meta)
-        hcf3 = region_hourly_cf(hist_all3, rs3)
-        dmin, dmax = hcf3["date"].min().date(), hcf3["date"].max().date()
-        c1, c2, c3, c4 = st.columns(4)
-        period = c1.date_input("기간", (dmin, dmax), min_value=dmin, max_value=dmax)
-        reserve3 = c2.slider("예비 충전량 (%)", 0, 50, 10, 5, key="bt_res") / 100
-        tol3 = c3.slider("페널티 없는 초과 범위 (%)", 0.0, 20.0, RULES.tolerance_2025, 0.5, key="bt_tol", help=TOL_HELP + " 2025년 데이터라 기본값은 2025년 기준(8%)이에요.")
-        margin3 = 20
-        c4.caption("배터리 사양·위치·가격은 왼쪽 사이드바에서 바꿔요.")
-        if isinstance(period, tuple) and len(period) == 2:
-            b_kwargs = dict(**DEG_KW, energy_kwh=energy, power_kw=power, soh=soh, efficiency=efficiency,
-                            capex_won_per_kwh=capex, cycle_life=cycle_life,
-                            soc_min=soc_range[0] / 100, soc_max=soc_range[1] / 100)
-            r3 = run_backtest(hcf3, prices, capacity, b_kwargs, market, tol3, reserve3, margin3,
-                              pd.Timestamp(period[0]), pd.Timestamp(period[1]))
-            tot = r3.sum()
-            n_days = len(r3)
-            st.markdown(f"#### {capacity:,.0f} kW · 배터리 {energy:,.0f} kWh / {power:,.0f} kW · "
-                        f"{', '.join(rs3)} 날씨 · {market} 가격 · {n_days}일")
-            k1, k2, k3, k4 = st.columns(4)
-            k1.metric("배터리 없이 (AI 예측대로)", f"{tot['none'] / 1e8:,.2f}억 원", help="실제 판매수입 − 페널티")
-            k2.metric("단순 규칙 (낮 충전·저녁 방전)", won(tot["rule"] - tot["none"]),
-                      help="현장에서 흔한 방식: 10~14시 발전량으로 최대한 충전, 18~21시 최대한 방전. 가격·감가는 안 봄")
-            k3.metric("최적화 · 감가 무시", won(tot["naive_da"] - tot["none"]),
-                      help="전날 예측 가격으로 수익을 최대화하지만 배터리를 공짜로 보고 계획 (정산 땐 실제 감가를 뺌)")
-            k4.metric("⚡ Voltics 가격-수량 입찰", won(tot["curve"] - tot["none"]),
-                      help="전날 정보만으로 '이 가격이면 담고, 이 가격이면 꺼내 판다'는 조건부 입찰. 비선형 감가 반영")
-
-            st.success(
-                f"같은 배터리라도 **단순 규칙대로 매일 돌리면 {won(tot['rule'] - tot['none'])}**, "
-                f"**감가를 무시하고 최적화하면 {won(tot['naive_da'] - tot['none'])}**인데, "
-                f"Voltics **가격-수량 입찰은 {won(tot['curve'] - tot['none'])}**이에요. "
-                f"(배터리를 쓴 날: 단순 규칙 {int((r3.rule_moved > 1).sum())}일 / Voltics {int((r3.curve_moved > 1).sum())}일)"
-            )
-
-            with st.expander("📋 비교군은 어떻게 운영했나요? (공정성 안내)"):
-                st.markdown(
-                    "모든 방식은 **같은 배터리 사양·같은 AI 예측·같은 실제 가격·같은 정산 규칙·같은 비선형 감가 모델**로 정산했어요. "
-                    "다른 건 '배터리를 언제 얼마나 쓰느냐' 하나뿐이에요.\n\n"
-                    "| 방식 | 운영 방법 | 가격 고려 | 감가 고려 |\n|---|---|---|---|\n"
-                    "| 배터리 없이 | AI 예측량 그대로 입찰 | – | – |\n"
-                    "| 단순 규칙 | 10~14시 충전, 18~21시 방전 (매일) | ✕ | ✕ |\n"
-                    "| 최적화 · 감가 무시 | 전날 예측 가격으로 수익 최대화 계획, 수량만 입찰 | ○ (예측) | ✕ |\n"
-                    "| 수량 입찰 · 감가+안전여유 | 위와 같되 감가 + kWh당 20원 여유 | ○ (예측) | ○ |\n"
-                    "| **Voltics 가격-수량 입찰** | 조건부 입찰(담기 기준가·꺼내기 기준가) | ○ (조건부) | ○ (비선형) |\n"
-                    "| 참고: 가격을 미리 알고 수량 계획 | 실제 가격을 안다고 치고 수량 계획 (현실에선 불가) | ○ (정답) | ○ |\n\n"
-                    "※ '참고' 줄은 상한선이 아니에요. 수량만 내는 방식이라, 조건부 입찰이 더 나을 때도 있어요."
-                )
-
-            st.markdown("##### 누적 수익 차이 (배터리 없음 대비, 만 원)")
-            cum = pd.DataFrame({
-                "단순 규칙": (r3["rule"] - r3["none"]).cumsum(),
-                "최적화 · 감가 무시": (r3["naive_da"] - r3["none"]).cumsum(),
-                "⚡ Voltics 가격-수량 입찰": (r3["curve"] - r3["none"]).cumsum(),
-            }) / 10_000
-            st.line_chart(cum)
-
-            keys = ["rule", "naive_da", "aware_da", "curve", "aware_rt"]
-            detail = pd.DataFrame({
-                "순수익 차이(만 원)": [0] + [(tot[k] - tot.none) / 1e4 for k in keys],
-                "초과 페널티(만 원)": [tot.none_pen / 1e4] + [tot[f"{k}_pen"] / 1e4 for k in keys],
-                "배터리 감가(만 원)": [0] + [tot[f"{k}_deg"] / 1e4 for k in keys],
-                "배터리 쓴 날(일)": [0] + [int((r3[f"{k}_moved"] > 1).sum()) for k in keys],
-            }, index=["배터리 없이", "단순 규칙 (낮 충전·저녁 방전)", "최적화 · 감가 무시", "수량 입찰 · 감가+안전여유",
-                      "⚡ Voltics 가격-수량 입찰", "참고: 가격을 미리 알고 수량 계획"])
-            st.dataframe(detail.style.format("{:,.0f}"), use_container_width=True)
-
-            with st.expander("이 숫자를 어떻게 봐야 하나요? (가정과 한계)"):
-                st.markdown(
-                    "- **수량만 입찰하면 손해인 이유**: 전날엔 내일 가격을 '예측'만 할 수 있어서, 예측이 빗나간 날 배터리를 써서 손해를 봐요.\n"
-                    "- **가격-수량 입찰이 이기는 이유**: '이 가격보다 싸면 담고, 이 가격 이상이면 꺼내 판다'는 조건을 걸어 두면, "
-                    "가격을 맞히지 않아도 실제 가격이 정해지는 순간 유리한 쪽으로 낙찰돼요.\n"
-                    "- **정산 가정**: 하루전·실시간 가격을 같은 시간별 SMP로 보고, 약속보다 허용범위를 넘게 더 보낸 양에만 페널티(별표 33 방식). "
-                    "실제 실시간 가격은 더 출렁여서, 배터리로 메우는 가치는 이보다 클 수 있어요.\n"
-                    "- **입찰 가정**: 하루전 시장에서 시간별 가격-수량 구간 입찰이 가능하고, 배터리(보조자원) 방전분도 입찰량에 넣을 수 있다고 봤어요. "
-                    "이 부분은 규칙 확인이 필요해요.\n"
-                    "- **AI 예측값**: AI 모델의 2025년 검증 결과(그날 관측된 기온·습도·바람·비 입력)라 실제 전날 예보보다 조금 정확할 수 있어요."
-                )
 
 # ---------- 탭 4: 실시간 운영 판단 ----------
 
