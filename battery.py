@@ -263,8 +263,9 @@ def decide_hour(promised_kwh, expected_kwh, price_now, future_prices, cap_kw,
         if x <= 0:
             continue
         cd = c_now(x, soc_now - x / eta / E if E > 0 else soc_now)
+        # 지금 꺼내든 나중에 꺼내든 같은 양을 꺼내면 감가는 비슷하게 생기므로, 나중 가치도 같은 감가(cd)로 비교
         o = dict(action="방전", kwh=x, now=settle(expected_kwh + x), pen=settle_parts(expected_kwh + x)[1],
-                 later=-x * hold_value, deg=-x * cd, c_kwh=cd)
+                 later=-x * max(future_best - cd, 0.0), deg=-x * cd, c_kwh=cd)
         o["total"] = o["now"] + o["later"] + o["deg"]
         sold = f"모자란 {min(x, shortfall):,.0f} kWh를 메우" if shortfall > 0 else ""
         add = x - min(x, shortfall)
@@ -272,10 +273,11 @@ def decide_hour(promised_kwh, expected_kwh, price_now, future_prices, cap_kw,
             sold += (" 고, " if sold else "") + f"약속 안 한 {add:,.0f} kWh를 더 팔아요(페널티 없는 범위 안, 예비 충전량은 남김)"
         else:
             sold += "요"
-        o["why"] = f"{sold}. 지금 {price_now:,.0f}원이 앞으로 최고가 {future_best:,.0f}원보다 낫다고 봐요."
+        o["why"] = (f"{sold}. 지금 가격 {price_now:,.0f}원이 앞으로 최고가 {future_best:,.0f}원보다 높아서, "
+                    "아껴 두는 것보다 지금 꺼내 쓰는 게 이득이에요.")
         if best_d is None or o["total"] > best_d["total"]:
             best_d = o
-    if best_d:
+    if best_d and best_d["total"] > options[0]["now"] + 0.5 * best_d["kwh"]:   # kWh당 0.5원도 안 남으면 굳이 안 꺼냄
         options.append(best_d)
 
     # 충전 후보: 남는 만큼만 / 넣을 수 있는 만큼 최대
@@ -303,16 +305,23 @@ def decide_hour(promised_kwh, expected_kwh, price_now, future_prices, cap_kw,
     if best.action == "충전":
         cc = best.c_kwh
         lost = 0.0 if (export_cap is not None and expected_kwh > (export_cap or 0)) else price_now
-        why_now = dict(a=("지금 팔면 kWh당" if lost else "지금 못 보내서 버리면 kWh당", lost),
-                       b=("담았다 나중에 팔면 kWh당", eta2 * hold_value - cc))
+        pen_avoid = float(table.loc[table.action == "대기", "pen"].iloc[0] - best.pen) / best.kwh if best.kwh else 0.0
+        if lost and pen_avoid > 0.5:
+            why_now = dict(a=("지금 팔면 kWh당 (초과 페널티 빼고)", lost - pen_avoid),
+                           b=("담았다 나중에 팔면 kWh당", eta2 * hold_value - cc))
+        else:
+            why_now = dict(a=("지금 팔면 kWh당" if lost else "지금 못 보내서 버리면 kWh당", lost),
+                           b=("담았다 나중에 팔면 kWh당", eta2 * hold_value - cc))
     elif best.action == "방전":
-        why_now = dict(a=("지금 꺼내 쓰면 kWh당", price_now - best.c_kwh), b=("아껴 뒀다 나중에 쓰면 kWh당", hold_value))
+        why_now = dict(a=("지금 꺼내 쓰면 kWh당", price_now - best.c_kwh),
+                       b=("아껴 뒀다 나중에 쓰면 kWh당", max(future_best - best.c_kwh, 0.0)))
     else:
         alt_c = table[table.action == "충전"]
         alt_d = table[table.action == "방전"]
-        if len(alt_d):
-            why_now = dict(a=("지금 꺼내 쓰면 kWh당", price_now - float(alt_d.c_kwh.iloc[0])),
-                           b=("아껴 뒀다 나중에 쓰면 kWh당", hold_value))
+        if len(alt_d) or best_d is not None:
+            cdx = float(alt_d.c_kwh.iloc[0]) if len(alt_d) else best_d["c_kwh"]
+            why_now = dict(a=("지금 꺼내 쓰면 kWh당", price_now - cdx),
+                           b=("아껴 뒀다 나중에 쓰면 kWh당", max(future_best - cdx, 0.0)))
         elif len(alt_c):
             why_now = dict(a=("지금 팔면 kWh당", price_now),
                            b=("담았다 나중에 팔면 kWh당", eta2 * hold_value - float(alt_c.c_kwh.iloc[0])))
