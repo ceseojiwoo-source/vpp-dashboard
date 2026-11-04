@@ -631,7 +631,7 @@ def render_replay():
         sunny_zero = dsum.loc[zero_days].sort_values("cf_act", ascending=False).index[:3] if zero_days else []
         over = (dsum.loc[avail, "cf_pred"] - dsum.loc[avail, "cf_act"]).sort_values(ascending=False).index[:2]
         picks = {f"☀️ 맑고 한낮 0원인 날 ({d:%Y-%m-%d})": d for d in sunny_zero}
-        picks.update({f"🌧️ AI가 많게 예측한 흐린 날 ({d:%Y-%m-%d})": d for d in over})
+        picks.update({f"🌧️ 실제 발전이 예측보다 크게 적었던 날 ({d:%Y-%m-%d})": d for d in over})
         picks["📅 직접 고르기"] = None
 
         c1, c2 = st.columns([2, 1])
@@ -682,8 +682,12 @@ def render_replay():
                   help="실제 판매수입 − 페널티")
         m2.metric("Voltics 가격-수량 입찰", f"{volt_r['net'] / 10_000:,.1f}만 원",
                   f"{(volt_r['net'] - base_r['net']) / 10_000:+,.2f}만 원", help="실제 판매수입 − 페널티 − 배터리 감가")
-        m3.metric("예측 정확도", f"발전 {abs(pred.sum() - actual.sum()) / max(actual.sum(), 1):.0%} 오차",
-                  f"가격 평균 {np.nanmean(np.abs(exp_p.values - act_price)):,.0f}원 오차", delta_color="off")
+        sun_h = (pred > 0) | (actual > 0)
+        cap_err = float(np.mean(np.abs(pred[sun_h] - actual[sun_h])) / capacity * 100) if sun_h.any() else 0.0
+        m3.metric("이날 AI 예측 오차", f"설비용량 대비 {cap_err:.0f}%",
+                  f"가격 평균 {np.nanmean(np.abs(exp_p.values - act_price)):,.0f}원 오차", delta_color="off",
+                  help="해가 있는 시간의 |예측 − 실제| ÷ 설비용량 평균 (전력거래소 예측제도와 같은 방식). "
+                       "2025년 1년 평균은 약 10~13%예요. 흐린 날이나 출력제어로 발전이 멈춘 날은 크게 나올 수 있어요.")
 
         hrs = [f"{h:02d}시" for h in range(24)]
         g1, g2 = st.columns(2)
