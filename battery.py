@@ -283,7 +283,7 @@ def decide_hour(promised_kwh, expected_kwh, price_now, future_prices, cap_kw,
     # 충전 후보: 남는 만큼만 / 넣을 수 있는 만큼 최대
     if can_ch > 0 and expected_kwh > 0:
         best_c = None
-        for y in sorted({min(can_ch, max(dev, 0.0)), min(can_ch, expected_kwh)}):
+        for y in sorted({min(can_ch, max(dev - allowed, 0.0)), min(can_ch, max(dev, 0.0)), min(can_ch, expected_kwh)}):   # 허용범위 넘는 양만 / 남는 양 전부 / 최대
             if y <= 0:
                 continue
             out = y * eta * eta
